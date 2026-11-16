@@ -23,7 +23,7 @@ jobs:
   build-rpm:
     runs-on: ubuntu-latest
     container:
-      image: fedora:latest
+      image: fedora:44
     outputs:
       version: ${{ steps.ver.outputs.version }}
     steps:
