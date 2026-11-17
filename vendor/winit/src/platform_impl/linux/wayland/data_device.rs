@@ -20,9 +20,12 @@ use sctk::reexports::client::{Connection, Proxy, QueueHandle};
 
 use crate::dpi::{LogicalPosition, PhysicalPosition};
 use crate::event::WindowEvent;
-use crate::file_drop::{AfterDrop, Out, URI_LIST};
+use crate::file_drop::{best_file_list_type, AfterDrop, Out};
 use crate::platform_impl::wayland::state::WinitState;
 use crate::platform_impl::wayland::{self, DeviceId, WindowId};
+
+/// The DND actions a drag of files may agree on.
+const DND_ACTIONS: DndAction = DndAction::Copy.union(DndAction::Move);
 
 impl WinitState {
     /// The window a drag is over and the place in it (`None` over the
@@ -168,8 +171,8 @@ impl WinitState {
 /// first, else a picture another program drags in (#2349).
 fn drag_type(offer: &DragOffer) -> Option<(String, Option<&'static str>)> {
     offer.with_mime_types(|m| {
-        if m.iter().any(|t| t == URI_LIST) {
-            return Some((URI_LIST.to_owned(), None));
+        if let Some(offered) = best_file_list_type(m.iter().map(String::as_str)) {
+            return Some((offered.to_owned(), None));
         }
         let (t, ext) = crate::picture_drop::best_type(m.iter().map(String::as_str))?;
         let offered = m.iter().find(|o| o.eq_ignore_ascii_case(t))?;
@@ -202,7 +205,7 @@ impl DataDeviceHandler for WinitState {
         let wanted = target.as_ref().and_then(|_| drag_type(&offer));
         let files = wanted.is_some();
         if let Some((mime, _)) = wanted {
-            offer.set_actions(DndAction::Copy, DndAction::Copy);
+            offer.set_actions(DND_ACTIONS, DndAction::Copy);
             offer.accept_mime_type(offer.serial, Some(mime));
         } else {
             offer.accept_mime_type(offer.serial, None);
@@ -247,6 +250,16 @@ impl DataDeviceHandler for WinitState {
             return;
         };
         if let Some((window_id, at)) = self.drag_target(&offer.surface, x, y) {
+            if !self.file_drag.active() {
+                if let Some((mime, _)) = drag_type(&offer) {
+                    offer.set_actions(DND_ACTIONS, DndAction::Copy);
+                    offer.accept_mime_type(offer.serial, Some(mime));
+                    if let Some(ticket) = self.file_drag.offer_files(window_id) {
+                        self.file_drop_offer = Some(offer.clone());
+                        self.read_file_list(&offer, ticket);
+                    }
+                }
+            }
             let mut out = Vec::new();
             self.file_drag.motion(window_id, at, &mut out);
             self.send_file_drop(out);
@@ -296,8 +309,20 @@ impl DataOfferHandler for WinitState {
         offer: &mut DragOffer,
         actions: DndAction,
     ) {
-        if self.file_drag.active() && actions.contains(DndAction::Copy) {
-            offer.set_actions(DndAction::Copy, DndAction::Copy);
+        if actions.intersects(DND_ACTIONS) {
+            if self.file_drag.active() {
+                offer.set_actions(DND_ACTIONS, DndAction::Copy);
+            } else if let Some((window_id, _)) = self.drag_target(&offer.surface, offer.x, offer.y)
+            {
+                if let Some((mime, _)) = drag_type(offer) {
+                    offer.set_actions(DND_ACTIONS, DndAction::Copy);
+                    offer.accept_mime_type(offer.serial, Some(mime));
+                    if let Some(ticket) = self.file_drag.offer_files(window_id) {
+                        self.file_drop_offer = Some(offer.clone());
+                        self.read_file_list(offer, ticket);
+                    }
+                }
+            }
         }
     }
 

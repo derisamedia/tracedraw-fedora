@@ -75,7 +75,7 @@ impl Dnd {
     ) -> Result<(), X11Error> {
         let atoms = self.xconn.atoms();
         let (accepted, action) = match state {
-            DndState::Accepted => (1, atoms[XdndActionPrivate]),
+            DndState::Accepted => (1, atoms[XdndActionCopy]),
             DndState::Rejected => (0, atoms[DndNone]),
         };
         self.xconn
@@ -99,7 +99,7 @@ impl Dnd {
     ) -> Result<(), X11Error> {
         let atoms = self.xconn.atoms();
         let (accepted, action) = match state {
-            DndState::Accepted => (1, atoms[XdndActionPrivate]),
+            DndState::Accepted => (1, atoms[XdndActionCopy]),
             DndState::Rejected => (0, atoms[DndNone]),
         };
         self.xconn
@@ -136,6 +136,8 @@ impl Dnd {
         let types = self.type_list.as_ref()?;
         [
             (atoms[TextUriList], None),
+            (atoms[GnomeCopiedFiles], None),
+            (atoms[KdeUris], None),
             (atoms[ImagePng], Some("png")),
             (atoms[ImageBmp], Some("bmp")),
             (atoms[ImageJpeg], Some("jpg")),
@@ -176,7 +178,14 @@ impl Dnd {
             Some((_, Some(ext))) => crate::picture_drop::save(data, ext)
                 .map(|p| vec![p])
                 .ok_or(DndDataParseError::EmptyData),
-            _ => self.parse_data(data),
+            _ => {
+                let paths = crate::file_drop::file_paths(data);
+                if paths.is_empty() {
+                    self.parse_data(data)
+                } else {
+                    Ok(paths)
+                }
+            }
         }
     }
 

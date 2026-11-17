@@ -382,7 +382,9 @@ pub fn run() -> eframe::Result<()> {
     #[cfg(target_os = "linux")]
     let x11_asked = args.iter().any(|a| a == "--x11");
     #[cfg(target_os = "linux")]
-    if x11_asked && !title_bar::env_set("DISPLAY") {
+    let has_display = title_bar::ensure_display_env();
+    #[cfg(target_os = "linux")]
+    if x11_asked && !has_display {
         // The log writes to stderr as well as to its file.
         log::error!(
             "tracedraw --x11: DISPLAY is not set, so there is no X server to open the window \
@@ -450,7 +452,7 @@ pub fn run() -> eframe::Result<()> {
         || title_bar::through_x11(
             settings.system_title_bar && !wayland_asked,
             title_bar::env_set("WAYLAND_DISPLAY"),
-            title_bar::env_set("DISPLAY"),
+            has_display,
             title_bar::compositor_offers_title_bars,
         );
     #[cfg(target_os = "linux")]

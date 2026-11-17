@@ -39,6 +39,40 @@ pub fn env_set(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|v| !v.is_empty())
 }
 
+/// Ensure `DISPLAY` is set when an X11 or XWayland socket is present in
+/// `/tmp/.X11-unix/` (some desktop launchers start applications with
+/// `WAYLAND_DISPLAY` alone even though XWayland is running). Returns
+/// whether `DISPLAY` is now set.
+#[cfg(target_os = "linux")]
+pub fn ensure_display_env() -> bool {
+    if env_set("DISPLAY") {
+        return true;
+    }
+    if let Some(display) = x11_socket_display(std::path::Path::new("/tmp/.X11-unix")) {
+        // SAFETY: called once at startup on the main thread before the
+        // windowing layer or worker threads read `DISPLAY`.
+        unsafe { std::env::set_var("DISPLAY", display) };
+        return true;
+    }
+    false
+}
+
+/// The first X11 display (`":0"`, `":1"`, ...) whose socket `X<n>` sits
+/// in `dir`.
+pub fn x11_socket_display(dir: &std::path::Path) -> Option<String> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut nums: Vec<u32> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name();
+            let s = name.to_str()?;
+            s.strip_prefix('X')?.parse::<u32>().ok()
+        })
+        .collect();
+    nums.sort_unstable();
+    nums.first().map(|n| format!(":{n}"))
+}
+
 /// Whether the Wayland compositor offers title bars to applications (it
 /// announces `zxdg_decoration_manager_v1`); `None` when it cannot be
 /// reached. One connection and one round trip, made before the window
@@ -130,5 +164,19 @@ mod tests {
         let bare: crate::settings::Settings =
             serde_json::from_str("{}").expect("empty preferences");
         assert!(bare.system_title_bar);
+    }
+
+    #[test]
+    fn finds_first_x11_socket_display() {
+        let dir =
+            std::env::temp_dir().join(format!("tracedraw-x11-sock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        assert_eq!(x11_socket_display(&dir), None);
+        std::fs::write(dir.join("X2"), b"").expect("X2");
+        std::fs::write(dir.join("X0"), b"").expect("X0");
+        std::fs::write(dir.join("other"), b"").expect("other");
+        assert_eq!(x11_socket_display(&dir).as_deref(), Some(":0"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

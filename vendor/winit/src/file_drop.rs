@@ -22,11 +22,35 @@
 
 use std::path::PathBuf;
 
-/// The type of a list of files on the Wayland data device (RFC 2483).
+/// The type of a list of files on the Wayland data device (RFC 2483),
+/// and the types file managers offer when `text/uri-list` is not listed.
 pub const URI_LIST: &str = "text/uri-list";
+pub const GNOME_COPIED_FILES: &str = "x-special/gnome-copied-files";
+pub const KDE_URIS: &str = "application/x-kde-uris";
 
-/// The local files of a `text/uri-list`: one URI a line (CR LF, or LF
-/// alone), `#` comment lines and blank lines skipped. Only `file:` URIs
+/// The MIME types of a file list drag, in order of preference.
+pub const FILE_LIST_TYPES: [&str; 3] = [URI_LIST, GNOME_COPIED_FILES, KDE_URIS];
+
+/// The preferred file-list MIME type among `offered` (case-insensitive),
+/// returning the exact string offered by the source.
+pub fn best_file_list_type<'a>(
+    offered: impl IntoIterator<Item = &'a str> + Clone,
+) -> Option<&'a str> {
+    for wanted in FILE_LIST_TYPES {
+        if let Some(found) = offered
+            .clone()
+            .into_iter()
+            .find(|o| o.eq_ignore_ascii_case(wanted))
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// The local files of a `text/uri-list` (or `x-special/gnome-copied-files`,
+/// whose first `copy` or `cut` line is skipped): one URI a line (CR LF, or
+/// LF alone), `#` comment lines and blank lines skipped. Only `file:` URIs
 /// of this computer count (`file:///p`, `file://localhost/p`, `file:/p`);
 /// their `%XX` escapes are decoded, so a name with spaces or non-ASCII
 /// letters comes back as it is on disk.
@@ -211,6 +235,27 @@ impl<W: Copy + PartialEq> FileDrag<W> {
         out.push(Out::Moved(window, at));
         if !files {
             return None;
+        }
+        let ticket = self.ticket();
+        self.drag = Some(Drag {
+            window,
+            ticket,
+            reading: true,
+            paths: Vec::new(),
+            hovered: false,
+            dropped: false,
+        });
+        Some(ticket)
+    }
+
+    /// A drag already over a window announces its list of files (or its
+    /// actions) after `enter`: starts reading the list when not yet being
+    /// read.
+    pub fn offer_files(&mut self, window: W) -> Option<u64> {
+        if let Some(d) = &self.drag {
+            if d.window == window {
+                return None;
+            }
         }
         let ticket = self.ticket();
         self.drag = Some(Drag {
@@ -478,6 +523,38 @@ mod tests {
         assert_eq!(
             out,
             vec![Out::Cancelled(1), Out::Moved(2, Some((4.0, 4.0)))]
+        );
+    }
+
+    #[test]
+    fn gnome_and_kde_file_lists_and_late_offers() {
+        let gnome = b"copy\nfile:///tmp/a.svg\nfile:///tmp/b%20c.png";
+        assert_eq!(
+            file_paths(gnome),
+            vec![PathBuf::from("/tmp/a.svg"), PathBuf::from("/tmp/b c.png")]
+        );
+        assert_eq!(
+            best_file_list_type(["text/plain", "x-special/gnome-copied-files"]),
+            Some("x-special/gnome-copied-files")
+        );
+        assert_eq!(
+            best_file_list_type(["x-special/gnome-copied-files", "text/uri-list"]),
+            Some("text/uri-list")
+        );
+        // A drag whose MIME types arrive after enter starts reading when offered.
+        let mut drag = FileDrag::new();
+        let mut out = Vec::new();
+        assert_eq!(drag.enter(5, Some((10.0, 10.0)), false, &mut out), None);
+        out.clear();
+        let ticket = drag.offer_files(5).expect("late offer starts reading");
+        assert_eq!(drag.offer_files(5), None, "already active");
+        assert!(!drag.data(ticket, gnome, &mut out));
+        assert_eq!(
+            out,
+            vec![
+                Out::Hovered(5, PathBuf::from("/tmp/a.svg")),
+                Out::Hovered(5, PathBuf::from("/tmp/b c.png")),
+            ]
         );
     }
 }
