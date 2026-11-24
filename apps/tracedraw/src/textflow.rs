@@ -51,7 +51,10 @@ pub fn without_links(data: &mut Vec<(String, String)>) {
 /// with the same structure (groups and clip frames copied member by
 /// member, in order): a link to a frame copied along points to its copy,
 /// so a chain copied whole stays a chain of the copies; a link to any
-/// other frame stays out.
+/// other frame stays out. A blend whose end object was copied along ends
+/// at that copy: it still named the original's end, so a pasted or
+/// duplicated blend drew its steps back to the original, and in another
+/// drawing to whatever object had that number there.
 pub fn relink_copies(originals: &[Shape], copies: &mut [Shape]) {
     fn map_ids(o: &Shape, c: &Shape, map: &mut HashMap<ShapeId, ShapeId>) {
         map.insert(o.id, c.id);
@@ -83,6 +86,38 @@ pub fn relink_copies(originals: &[Shape], copies: &mut [Shape]) {
         for key in [NEXT, PREV] {
             if let Some(to) = data_id(&o.data, key).and_then(|id| map.get(&id)) {
                 c.data = with_key(std::mem::take(&mut c.data), key, Some(*to));
+            }
+        }
+        // A text put inside a shape copied along is inside that copy; a
+        // copy made without the shape is a plain frame.
+        if let ShapeKind::Text { para, .. } = &mut c.kind {
+            if let Some(was) = para.inside {
+                para.inside = map.get(&was).copied();
+            }
+        }
+        // A dimension copied with the object it measures measures the
+        // copy: its anchors named the original, so the copied dimension
+        // followed the original rectangle and not its own (#3345).
+        if let Some(mut d) = crate::dimensions::Dimension::of(o) {
+            let mut moved = false;
+            for a in &mut d.anchors {
+                if let Some(to) = map.get(&a.shape) {
+                    a.shape = *to;
+                    moved = true;
+                }
+            }
+            if moved {
+                c.data = crate::dimensions::with_data(std::mem::take(&mut c.data), &d);
+            }
+        }
+        for e in &mut c.effects {
+            if let tracedraw_core::live::Effect::Blend {
+                end_id: Some(end), ..
+            } = e
+            {
+                if let Some(to) = map.get(end) {
+                    *end = *to;
+                }
             }
         }
         match (&o.kind, &mut c.kind) {
@@ -267,6 +302,75 @@ impl App {
             (a, b)
         };
         self.link_frames(a, b);
+    }
+
+    /// Text > Paragraph Text Frame > Put Text Inside Shape: with one text
+    /// and one closed shape selected, the text becomes a frame as large
+    /// as the shape and its lines stay inside the shape's outline, also
+    /// after the shape is moved or edited (discussion #3238). The text
+    /// goes over the shape when it was under it.
+    pub fn put_text_inside_shape(&mut self) {
+        use tracedraw_core::geometry::Shape as _;
+        let picked = self.selected_shapes();
+        let text = picked
+            .iter()
+            .find(|s| matches!(s.kind, ShapeKind::Text { on_path: None, .. }));
+        let shape = picked.iter().find(|s| {
+            !matches!(s.kind, ShapeKind::Text { .. })
+                && s.page_path()
+                    .elements()
+                    .iter()
+                    .any(|e| matches!(e, tracedraw_core::geometry::PathEl::ClosePath))
+        });
+        let (Some(text), Some(shape), 2) = (text, shape, picked.len()) else {
+            self.status = tr("status.inside_needs_text_and_shape");
+            return;
+        };
+        let ShapeKind::Text {
+            spans, align, para, ..
+        } = text.kind.clone()
+        else {
+            return;
+        };
+        // The shape's box in the text's own space: the frame the lines
+        // are laid in before the outline narrows them.
+        let room = (text.transform.inverse() * shape.page_path()).bounding_box();
+        if !(room.width() > 0.0 && room.height() > 0.0) {
+            self.status = tr("status.inside_needs_text_and_shape");
+            return;
+        }
+        let mut para = para;
+        para.inside = Some(shape.id);
+        let mut cmds = vec![Command::SetShapeKind {
+            shape: text.id,
+            kind: ShapeKind::Text {
+                spans,
+                origin: Point::new(room.x0, room.y0),
+                frame: Some(tracedraw_core::geometry::Size::new(
+                    room.width(),
+                    room.height(),
+                )),
+                align,
+                para,
+                on_path: None,
+            },
+        }];
+        if let (Ok((lt, it)), Ok((ls, is))) =
+            (self.doc().locate(text.id), self.doc().locate(shape.id))
+        {
+            if lt == ls && it < is {
+                cmds.push(Command::Reorder {
+                    shape: text.id,
+                    layer: ls,
+                    index: is,
+                });
+            }
+        }
+        let id = text.id;
+        if self.engine.run_batch("Put Text Inside Shape", &cmds).is_ok() {
+            self.select(vec![id]);
+            self.status = tr("status.text_put_inside");
+        }
     }
 
     /// `id` is a paragraph frame with no characters, in no chain.
@@ -582,7 +686,10 @@ impl App {
         };
         let cmds = self.flow_commands(&chain, all);
         if !cmds.is_empty() {
-            let _ = self.engine.run_batch("Text Flow", &cmds);
+            // The flow is part of the change that made it (a link, an
+            // edit, a resize): one Undo takes both back. It is a step of
+            // its own only when something else happened in between.
+            let _ = self.engine.amend_batch("Text Flow", &cmds);
         }
     }
 
@@ -611,52 +718,10 @@ impl App {
         if kinds.len() != chain.len() {
             return Vec::new();
         }
-        let fonts = tracedraw_text::fonts();
-        let mut cmds = Vec::new();
-        let mut rest = all;
-        let n = chain.len();
-        for (i, (id, kind)) in chain.iter().zip(kinds).enumerate() {
-            let ShapeKind::Text {
-                origin,
-                frame,
-                align,
-                para,
-                on_path,
-                spans: old,
-            } = kind
-            else {
-                continue;
-            };
-            let mine = if i + 1 == n {
-                std::mem::take(&mut rest)
-            } else {
-                let layout = fonts.layout(&TextRequest {
-                    spans: &rest,
-                    frame,
-                    align,
-                    para: &para,
-                    on_path: on_path.as_ref(),
-                });
-                let (head, tail) = tracedraw_core::split_spans_at(&rest, layout.fitted_chars);
-                rest = tail;
-                head
-            };
-            if mine == old {
-                continue;
-            }
-            cmds.push(Command::SetShapeKind {
-                shape: *id,
-                kind: ShapeKind::Text {
-                    spans: mine,
-                    origin,
-                    frame,
-                    align,
-                    para,
-                    on_path,
-                },
-            });
-        }
-        cmds
+        flow_kinds(chain, kinds, all)
+            .into_iter()
+            .map(|(shape, kind)| Command::SetShapeKind { shape, kind })
+            .collect()
     }
 
     /// The commands that keep the text of a chain when the objects
@@ -754,10 +819,157 @@ impl App {
     }
 }
 
+/// The text `all` laid over the frames `chain` (their kinds `kinds`) in
+/// order: each frame keeps what fits, the rest flows on and the last
+/// frame takes whatever is left. Only frames whose text changes are
+/// returned, with their new kinds.
+fn flow_kinds(
+    chain: &[ShapeId],
+    kinds: Vec<ShapeKind>,
+    all: Vec<TextSpan>,
+) -> Vec<(ShapeId, ShapeKind)> {
+    let fonts = tracedraw_text::fonts();
+    let mut out = Vec::new();
+    let mut rest = all;
+    let n = chain.len();
+    for (i, (id, kind)) in chain.iter().zip(kinds).enumerate() {
+        let ShapeKind::Text {
+            origin,
+            frame,
+            align,
+            para,
+            on_path,
+            spans: old,
+        } = kind
+        else {
+            continue;
+        };
+        let mine = if i + 1 == n {
+            std::mem::take(&mut rest)
+        } else {
+            let layout = fonts.layout(&TextRequest {
+                spans: &rest,
+                frame,
+                align,
+                para: &para,
+                on_path: on_path.as_ref(),
+            });
+            let (head, tail) = tracedraw_core::split_spans_at(&rest, layout.fitted_chars);
+            rest = tail;
+            head
+        };
+        if mine == old {
+            continue;
+        }
+        out.push((
+            *id,
+            ShapeKind::Text {
+                spans: mine,
+                origin,
+                frame,
+                align,
+                para,
+                on_path,
+            },
+        ));
+    }
+    out
+}
+
+/// Link the paragraph frames a file marked as runs of one text
+/// ([`tracedraw_io::pdf_paragraphs::FLOW_KEY`]; a `.cdr` whose text
+/// continues in other frames keeps it all in the first, #4104, #2018) and
+/// let each run's text flow from its first frame over the others, as it
+/// does once frames are linked by hand. A frame that opened empty takes
+/// the alignment and paragraph settings of the first frame, its own
+/// columns kept.
+pub fn link_and_flow_marked_frames(doc: &mut tracedraw_core::Document) {
+    let links = {
+        let shapes: Vec<&Shape> = doc
+            .pages
+            .iter()
+            .flat_map(|p| &p.layers)
+            .flat_map(|l| &l.shapes)
+            .collect();
+        imported_flow_links(&shapes)
+    };
+    if links.is_empty() {
+        return;
+    }
+    let mut heads = Vec::new();
+    for (id, data) in links {
+        if data_id(&data, PREV).is_none() && data_id(&data, NEXT).is_some() {
+            heads.push(id);
+        }
+        if let Some(s) = doc.find_shape_mut(id) {
+            s.data = data;
+        }
+    }
+    for head in heads {
+        let mut chain = vec![head];
+        while let Some(next) = chain
+            .last()
+            .and_then(|id| doc.find_shape(*id))
+            .and_then(|s| data_id(&s.data, NEXT))
+        {
+            if chain.contains(&next) || chain.len() > 1000 {
+                break;
+            }
+            chain.push(next);
+        }
+        let Some(mut kinds) = chain
+            .iter()
+            .map(|id| doc.find_shape(*id).map(|s| s.kind.clone()))
+            .collect::<Option<Vec<ShapeKind>>>()
+        else {
+            continue;
+        };
+        let first = match kinds.first() {
+            Some(ShapeKind::Text { align, para, .. }) => Some((*align, para.clone())),
+            _ => None,
+        };
+        let mut all: Vec<TextSpan> = Vec::new();
+        for (i, kind) in kinds.iter_mut().enumerate() {
+            let ShapeKind::Text {
+                spans, align, para, ..
+            } = kind
+            else {
+                continue;
+            };
+            if i > 0 && spans.iter().all(|s| s.text.is_empty()) {
+                if let Some((a, p)) = &first {
+                    let own = para.clone();
+                    *align = *a;
+                    *para = tracedraw_core::document::ParagraphStyle {
+                        columns: own.columns,
+                        gutter: own.gutter,
+                        column_widths: own.column_widths,
+                        column_gutters: own.column_gutters,
+                        drop_cap_lines: 0,
+                        ..p.clone()
+                    };
+                }
+            }
+            all.extend(spans.iter().cloned());
+        }
+        let laid = kinds.clone();
+        for (id, kind) in chain.iter().zip(laid) {
+            if let Some(s) = doc.find_shape_mut(*id) {
+                s.kind = kind;
+            }
+        }
+        for (id, kind) in flow_kinds(&chain, kinds, all) {
+            if let Some(s) = doc.find_shape_mut(id) {
+                s.kind = kind;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tracedraw_core::geometry::{Point, Size};
+    use tracedraw_core::geometry::{Affine, Point, Size};
     use tracedraw_core::TextAlign;
 
     fn frame(app: &mut App, text: &str, w: f64, h: f64) -> ShapeId {
@@ -900,6 +1112,126 @@ mod tests {
     }
 
     const LONG: &str = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty";
+
+    /// A `.cdr` text that continues in other frames keeps all of it in
+    /// its first frame, the others opening empty and marked as its run
+    /// (#4104, #2018): on opening they are linked in order and the text
+    /// flows over them, the empty ones taking the first frame's alignment.
+    #[test]
+    fn frames_marked_as_one_run_are_linked_and_the_text_flows_on() {
+        tracedraw_text::install();
+        let mut app = App::headless();
+        let a = frame(&mut app, LONG, 30.0, 8.0);
+        let c = frame(&mut app, "", 60.0, 60.0);
+        let b = frame(&mut app, "", 30.0, 8.0);
+        let mut doc = app.doc().clone();
+        for (id, place) in [(a, 0), (b, 1), (c, 2)] {
+            let s = doc.find_shape_mut(id).unwrap();
+            s.data.push((
+                tracedraw_io::pdf_paragraphs::FLOW_KEY.to_string(),
+                format!("7:{place}"),
+            ));
+            if place == 0 {
+                if let ShapeKind::Text { ref mut align, .. } = s.kind {
+                    *align = TextAlign::Center;
+                }
+            }
+        }
+        link_and_flow_marked_frames(&mut doc);
+        let text = |id: ShapeId| match doc.find_shape(id).map(|s| &s.kind) {
+            Some(ShapeKind::Text { spans, .. }) => spans.iter().map(|s| s.text.as_str()).collect(),
+            _ => String::new(),
+        };
+        let texts = [text(a), text(b), text(c)];
+        assert!(texts.iter().all(|t| !t.is_empty()), "{texts:?}");
+        assert_eq!(texts.concat(), LONG);
+        let shape = |id: ShapeId| doc.find_shape(id).unwrap();
+        assert_eq!(data_id(&shape(a).data, NEXT), Some(b));
+        assert_eq!(data_id(&shape(b).data, NEXT), Some(c));
+        assert_eq!(data_id(&shape(c).data, PREV), Some(b));
+        assert!(matches!(
+            shape(c).kind,
+            ShapeKind::Text {
+                align: TextAlign::Center,
+                ..
+            }
+        ));
+    }
+
+    /// Linking two frames, editing the text of a linked frame and
+    /// resizing one are one Undo each, the text flow with them: the flow
+    /// was a step of its own, so one Undo left the frames linked or
+    /// resized with their text flowed as before.
+    #[test]
+    fn a_change_to_linked_frames_and_its_flow_are_one_undo() {
+        tracedraw_text::install();
+        let mut app = App::headless();
+        let a = frame(&mut app, LONG, 30.0, 8.0);
+        let b = frame(&mut app, "", 60.0, 60.0);
+        let unlinked = app.doc().to_json().unwrap();
+        assert!(app.link_frames(a, b));
+        assert_eq!(app.engine.undo_label(), Some("Link Frames"));
+        let linked = app.doc().to_json().unwrap();
+        app.undo();
+        assert_eq!(app.doc().to_json().unwrap(), unlinked, "one Undo unlinks");
+        app.redo();
+        assert_eq!(app.doc().to_json().unwrap(), linked);
+
+        // Editing the text.
+        let other = LONG.replace("one", "zero");
+        app.set_text_spans(a, vec![TextSpan::new(&other, "DejaVu Sans", 12.0)]);
+        assert!(text_of(&app, b).ends_with("twenty"), "the text flowed on");
+        app.undo();
+        assert_eq!(
+            app.doc().to_json().unwrap(),
+            linked,
+            "one Undo: the old text"
+        );
+
+        // Resizing the first frame: it shows less, the second more.
+        let tb = text_of(&app, b);
+        app.select(vec![a]);
+        app.transform_selection(Affine::scale_non_uniform(0.5, 1.0));
+        assert_ne!(text_of(&app, b), tb, "the text flowed again");
+        app.undo();
+        assert_eq!(
+            app.doc().to_json().unwrap(),
+            linked,
+            "one Undo: the old size and the old flow"
+        );
+    }
+
+    /// Copies made by the Transformations docker of a whole chain are a
+    /// chain of their own, as Step and Repeat makes them: they came out
+    /// unlinked, each holding the piece of text it showed.
+    #[test]
+    fn transformation_copies_of_a_chain_are_linked() {
+        tracedraw_text::install();
+        let mut app = App::headless();
+        let a = frame(&mut app, LONG, 30.0, 8.0);
+        let b = frame(&mut app, "", 60.0, 60.0);
+        assert!(app.link_frames(a, b));
+        app.select(vec![a, b]);
+        app.transform.tab = crate::app::TransformTab::Position;
+        app.transform.position = [0.0, 80.0];
+        app.transform.copies = 2;
+        crate::ui::transform_docker::apply(&mut app);
+        let copies = app.selection.clone();
+        assert_eq!(copies.len(), 2);
+        assert_eq!(app.next_frame(copies[0]), Some(copies[1]));
+        assert_eq!(app.prev_frame(copies[1]), Some(copies[0]));
+        assert_eq!(app.chain_of(a), vec![a, b], "the original chain as it was");
+        // The first round of copies is a chain too, of its own.
+        let all: Vec<ShapeId> = app.doc().pages[0].layers[0]
+            .shapes
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(all.len(), 6);
+        assert_eq!(app.chain_of(all[2]), vec![all[2], all[3]]);
+        app.undo();
+        assert_eq!(app.doc().pages[0].layers[0].shapes.len(), 2);
+    }
 
     /// A chain of three frames, the first two a line high, the third
     /// large enough for the rest; with the text each shows.
@@ -1051,6 +1383,87 @@ mod tests {
         assert_eq!(text_of(&app, b), LONG);
         let shape = app.doc().find_shape(b).cloned().expect("frame");
         assert!(!app.text_overflows(&shape));
+    }
+
+    /// A page or a layer deleted with a frame of a chain on it leaves
+    /// the frame's text to the chain, as a deleted frame does: the text
+    /// the frame showed was lost with the page or the layer.
+    #[test]
+    fn deleting_a_page_or_layer_holding_a_frame_of_a_chain_keeps_its_text() {
+        use crate::ui::objects_docker::{delete_current, move_to_layer, new_layer};
+        tracedraw_text::install();
+        let mut app = App::headless();
+        let ([a, b, c], [ta, tb, tc]) = chain_of_three(&mut app);
+        app.add_page();
+        let second = app.doc().pages[1].layers[0].id;
+        move_to_layer(&mut app, &[b], second);
+        assert_eq!(app.chain_of(a), vec![a, b, c]);
+        let kept = |app: &App| {
+            assert!(app.doc().find_shape(b).is_none());
+            assert_eq!(app.chain_of(a), vec![a, c]);
+            assert_eq!(text_of(app, a), ta);
+            assert_eq!(text_of(app, c), format!("{tb}{tc}"));
+        };
+        let back = |app: &mut App| {
+            app.undo();
+            assert_eq!(app.chain_of(a), vec![a, b, c]);
+            assert_eq!(text_of(app, b), tb);
+            assert_eq!(text_of(app, c), tc);
+        };
+        // The page tab's Delete, on the second page.
+        app.goto_page(1);
+        app.delete_page();
+        kept(&app);
+        back(&mut app);
+        // Page > Delete Page.
+        app.delete_pages(1, 1);
+        kept(&app);
+        back(&mut app);
+        // The frame's layer deleted in the Objects docker.
+        app.goto_page(0);
+        new_layer(&mut app);
+        let layer = app.doc().pages[0]
+            .layers
+            .last()
+            .map(|l| l.id)
+            .expect("layer");
+        move_to_layer(&mut app, &[b], layer);
+        app.select(vec![]);
+        app.picked_layer = Some(layer);
+        delete_current(&mut app);
+        assert!(app.doc().layer(layer).is_err(), "the layer is gone");
+        kept(&app);
+        back(&mut app);
+    }
+
+    /// A page duplicated with its contents: its copied chain of frames is
+    /// a chain of the copies, the original chain as it was. The copied
+    /// frames named the original frames, so the copies ran on into the
+    /// original chain.
+    #[test]
+    fn a_duplicated_page_keeps_its_copied_chain_to_itself() {
+        tracedraw_text::install();
+        let mut app = App::headless();
+        let ([a, b, c], texts) = chain_of_three(&mut app);
+        let steps = app.engine.history_labels().0.len();
+        app.duplicate_page(false, true);
+        assert_eq!(app.engine.history_labels().0.len(), steps + 1);
+        assert_eq!(app.chain_of(a), vec![a, b, c], "the original chain");
+        let copies: Vec<ShapeId> = app.doc().pages[1].layers[0]
+            .shapes
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(copies.len(), 3);
+        assert_eq!(app.chain_of(copies[0]), copies, "a chain of the copies");
+        let copied: Vec<String> = copies.iter().map(|id| text_of(&app, *id)).collect();
+        assert_eq!(copied, texts.to_vec());
+        for id in &copies {
+            assert_eq!(app.chain_head(*id), copies[0]);
+        }
+        app.undo();
+        assert_eq!(app.doc().pages.len(), 1);
+        assert_eq!(app.chain_of(a), vec![a, b, c]);
     }
 
     /// Cut takes a frame of a chain out the same way: the text stays
@@ -1267,5 +1680,115 @@ mod tests {
         assert_eq!(found.len(), 2, "{}", app.status);
         assert_eq!(app.next_frame(found[0]), Some(found[1]));
         assert_eq!(app.engine.history_labels().0.len(), steps + 1);
+    }
+
+    /// Put Text Inside Shape (discussion #3238): the text's lines follow
+    /// the outline of the shape it was put into, a triangle here, so
+    /// they grow wider towards its base; the shape moved, they go along.
+    #[test]
+    fn text_put_inside_a_shape_stays_inside_its_outline() {
+        use tracedraw_core::geometry::{BezPath, Shape as _};
+        tracedraw_text::install();
+        let mut app = App::headless();
+        let words = "aa ".repeat(400);
+        let t = app
+            .new_shape(ShapeKind::Text {
+                spans: vec![TextSpan::new(words.trim(), "DejaVu Sans", 8.0)],
+                origin: Point::new(300.0, 300.0),
+                frame: None,
+                align: TextAlign::Left,
+                para: Default::default(),
+                on_path: None,
+            })
+            .unwrap();
+        let mut tri = BezPath::new();
+        tri.move_to((50.0, 20.0));
+        tri.line_to((90.0, 100.0));
+        tri.line_to((10.0, 100.0));
+        tri.close_path();
+        let s = app
+            .new_shape(ShapeKind::Path {
+                path: tri.clone(),
+                closed: true,
+            })
+            .unwrap();
+        // One object alone is not enough.
+        app.select(vec![t]);
+        app.put_text_inside_shape();
+        assert_eq!(app.status, tr("status.inside_needs_text_and_shape"));
+        app.select(vec![t, s]);
+        app.put_text_inside_shape();
+        assert_eq!(app.status, tr("status.text_put_inside"));
+        let inside = |app: &App| {
+            let text = app.doc().find_shape(t).unwrap().clone();
+            let outline = app.doc().find_shape(s).unwrap().page_path();
+            let ink = text.page_path();
+            let b = ink.bounding_box();
+            assert!(b.width() > 20.0 && b.height() > 20.0, "{b:?}");
+            // Every corner of every letter is in the triangle.
+            let mut n = 0;
+            for el in ink.elements() {
+                let p = match el {
+                    tracedraw_core::geometry::PathEl::MoveTo(p)
+                    | tracedraw_core::geometry::PathEl::LineTo(p) => *p,
+                    _ => continue,
+                };
+                n += 1;
+                assert!(outline.winding(p) != 0, "{p:?} is outside");
+            }
+            assert!(n > 50);
+            b
+        };
+        let b = inside(&app);
+        assert!(matches!(
+            &app.doc().find_shape(t).unwrap().kind,
+            ShapeKind::Text { frame: Some(_), para, .. } if para.inside == Some(s)
+        ));
+        // The text is over the shape.
+        let (_, it) = app.doc().locate(t).unwrap();
+        let (_, is) = app.doc().locate(s).unwrap();
+        assert!(it > is);
+        // The shape alone moved a little: the lines follow its outline.
+        app.select(vec![s]);
+        app.run(Command::TransformShapes {
+            shapes: vec![s],
+            transform: Affine::translate((6.0, 0.0)),
+        });
+        let moved = inside(&app);
+        assert!(moved.x0 > b.x0 + 1.0, "{b:?} {moved:?}");
+        // Both duplicated: the copy of the text is inside the copy of
+        // the shape, not the original.
+        let originals = vec![
+            app.doc().find_shape(t).unwrap().clone(),
+            app.doc().find_shape(s).unwrap().clone(),
+        ];
+        let mut n = 9000;
+        let mut copies: Vec<Shape> = originals
+            .iter()
+            .map(|o| {
+                o.with_fresh_ids(&mut || {
+                    n += 1;
+                    ShapeId(n)
+                })
+            })
+            .collect();
+        relink_copies(&originals, &mut copies);
+        assert!(matches!(
+            &copies[0].kind,
+            ShapeKind::Text { para, .. } if para.inside == Some(copies[1].id)
+        ));
+        let mut alone = vec![copies[0].clone()];
+        relink_copies(&originals[..1], &mut alone);
+        assert!(matches!(
+            &alone[0].kind,
+            ShapeKind::Text { para, .. } if para.inside.is_none()
+        ));
+        // One step back takes the whole command back.
+        app.undo();
+        app.undo();
+        assert!(matches!(
+            &app.doc().find_shape(t).unwrap().kind,
+            ShapeKind::Text { frame: None, para, .. } if para.inside.is_none()
+        ));
     }
 }

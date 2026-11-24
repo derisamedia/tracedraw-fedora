@@ -47,6 +47,12 @@ configurações, e **Aplicar** as guarda para a próxima vez.
   separações**; só as tintas marcadas são impressas.
 - **Converter cores especiais em CMYK** imprime as tintas especiais como a
   mistura CMYK delas.
+- **Perfil de cor** converte as cores e imagens para o perfil ICC da
+  impressora (RGB ou CMYK, dos perfis instalados neste computador), para
+  impressoras cujo driver não gerencia as cores, como as de sublimação.
+  Escolha a **Intenção** ao lado. Funciona na saída Composta, não em Tons de
+  cinza nem em Separações. Desligue o gerenciamento de cor do driver da
+  impressora para as cores não serem convertidas duas vezes.
 
 ## Composta {#composite}
 
@@ -57,8 +63,10 @@ configurações, e **Aplicar** as guarda para a próxima vez.
 ## Layout {#layout}
 
 - **Como no documento**, **Ajustar à página** ou **Escala** em porcentagem.
-  **Ajustar à página** também reduz objetos maiores que a página (ou a
-  seleção, quando só ela é impressa) para que saiam inteiros nela.
+  **Ajustar à página** aumenta ou reduz a página para ocupar o papel dentro
+  das margens; o que você deixou em parte fora da página continua cortado na
+  borda, como na tela. Quando só a seleção é impressa, ela é reduzida para
+  caber na página.
 - **Limite de sangria**: até onde além da página os objetos são impressos
   (4 mm de início, ou a sangria do próprio desenho).
 - **Margens do papel** (esquerda, direita, superior, inferior, 0 de início)
@@ -143,6 +151,25 @@ imposição e as marcas.
   papel, e arraste a folha para mover a arte na página (**Posição da arte**
   mostra o deslocamento, com **Redefinir**). **Transformar** mostra alças para
   esticar a arte.
+
+## Ver uma tinta enquanto desenha {#view-separations}
+
+[[menu.view > menu.view.separations]] mostra a página na janela de desenho
+como uma tinta a imprime, na cor dessa tinta: o ciano em ciano, o magenta em
+magenta, e cada tinta especial do desenho com o próprio nome. Escolha uma
+tinta no submenu e continue editando; o desenho em si não muda.
+[[menu.view.separations_composite]] volta a mostrar todas as tintas.
+
+![Três círculos ciano, magenta e amarelo sobrepostos, vistos só pela tinta magenta](../../img/printing-print-view-separations.png)
+
+## Achatar a transparência {#flatten-transparency}
+
+Algumas impressoras e formatos de arquivo antigos não sabem misturar objetos
+transparentes com o que está embaixo deles.
+[[menu.object > menu.object.flatten_transparency]] transforma os objetos
+selecionados em um único bitmap opaco de como eles aparecem sobre o que está
+embaixo, a 300 dpi e com o formato deles, no mesmo lugar da pilha. Os objetos
+de baixo continuam como estão. Um único Desfazer volta tudo.
 
 ## Outras formas de imprimir {#other}
 

@@ -14,7 +14,7 @@ use egui::{Color32, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 /// Height of the bottom row and width of the vertical scrollbar.
 pub const BAR: f32 = 17.0;
 /// One click on a scroll arrow moves the view this many pixels.
-const LINE: f32 = 40.0;
+pub(crate) const LINE: f32 = 40.0;
 
 /// Draw the scrollbars, the navigator row and the corner button around
 /// `canvas` inside `full`.
@@ -217,7 +217,7 @@ fn vertical(app: &mut App, ui: &mut Ui, bar: Rect, canvas: Rect) {
 }
 
 #[derive(Clone, Copy)]
-enum Dir {
+pub(crate) enum Dir {
     Left,
     Right,
     Up,
@@ -225,7 +225,7 @@ enum Dir {
 }
 
 /// A scroll arrow; repeats while held (after a short delay).
-fn arrow_button(ui: &mut Ui, r: Rect, id: &str, dir: Dir) -> bool {
+pub(crate) fn arrow_button(ui: &mut Ui, r: Rect, id: &str, dir: Dir) -> bool {
     let key = match dir {
         Dir::Left => "view.scroll_left",
         Dir::Right => "view.scroll_right",
@@ -340,14 +340,22 @@ pub fn page_navigator(app: &mut App, ui: &mut Ui) {
         if nav_button(ui, Glyph::Previous, &tr("status.previous_page")) && idx > 0 {
             app.goto_page(idx - 1);
         }
-        ui.label(
-            egui::RichText::new(trf(
-                "status.page_n_of_m",
-                &[("n", &(idx + 1).to_string()), ("m", &n.to_string())],
-            ))
-            .size(11.0)
-            .color(Tokens::text_dim()),
+        let counter = ui.add(
+            egui::Label::new(
+                egui::RichText::new(trf(
+                    "status.page_n_of_m",
+                    &[("n", &(idx + 1).to_string()), ("m", &n.to_string())],
+                ))
+                .size(11.0)
+                .color(Tokens::text_dim()),
+            )
+            .sense(Sense::click()),
         );
+        // A double click on "1 of N" opens Go to Page, when there is
+        // another page to go to (#3780).
+        if counter.double_clicked() && n > 1 {
+            app.dialog = crate::ui::dialogs::Dialog::GoToPage { page: idx + 1 };
+        }
         if nav_button(ui, Glyph::Next, &tr("status.next_page")) {
             app.goto_page(idx + 1);
         }
@@ -504,6 +512,10 @@ fn nav_button(ui: &mut Ui, g: Glyph, tip: &str) -> bool {
     resp.rich_tip(tip).clicked()
 }
 
+/// The longer side of the page miniature in a page tab's tip, points
+/// (#2932).
+const TAB_THUMB: f32 = 140.0;
+
 /// One tab per page, slanted at the sides; the current page's tab is white.
 /// The tabs that fit are shown from `App::page_tabs_first`: they slide so
 /// the current page's tab shows whenever the page changes, and the mouse
@@ -631,9 +643,34 @@ fn page_tabs(app: &mut App, ui: &mut Ui, area: Rect) {
             }
             _ => slot,
         };
-        let resp = ui
-            .interact(r, egui::Id::new(("page_tab", i)), Sense::click_and_drag())
-            .rich_tip(format!("{name}\n{}", tr("view.page_tab_desc")));
+        // The tip shows the page's miniature above its name, so the page
+        // is found without going to it (#2932).
+        let page_id = app.doc().pages.get(i).map(|p| (p.id, p.size));
+        let revision = app.engine.revision();
+        let resp = crate::ui::tips::rich_tip_with_picture(
+            ui.interact(r, egui::Id::new(("page_tab", i)), Sense::click_and_drag()),
+            format!("{name}\n{}", tr("view.page_tab_desc")),
+            |ui| {
+                if let Some((id, size)) = page_id {
+                    let thumb = crate::ui::preview::page_thumb(
+                        ui,
+                        app.doc(),
+                        revision,
+                        id,
+                        TAB_THUMB,
+                    );
+                    let aspect = (size.width / size.height.max(1e-6)) as f32;
+                    let box_size = if aspect >= 1.0 {
+                        Vec2::new(TAB_THUMB, TAB_THUMB / aspect.min(8.0))
+                    } else {
+                        Vec2::new(TAB_THUMB * aspect.max(0.125), TAB_THUMB)
+                    };
+                    let (rect, _) = ui.allocate_exact_size(box_size, Sense::hover());
+                    crate::ui::preview::paint_page_thumb(ui, rect, thumb, size);
+                    ui.add_space(4.0);
+                }
+            },
+        );
         // A tab dragged along the row and let go moves its page to the
         // place the other tabs made for it (#2064, #2712).
         if resp.drag_started() {
@@ -1033,6 +1070,16 @@ mod tests {
         frame(&mut app, vec![key(Key::N, true, Modifiers::SHIFT)]);
         assert!(!app.navigator_open);
         frame(&mut app, vec![key(Key::N, false, Modifiers::SHIFT)]);
+        // Held with the pointer over the drawing: it comes up at the
+        // pointer, not in the corner (#3086).
+        let at = egui::pos2(500.0, 380.0);
+        frame(&mut app, vec![Event::PointerMoved(at)]);
+        frame(&mut app, vec![key(Key::N, true, Modifiers::NONE)]);
+        frame(&mut app, Vec::new());
+        let r = popup(&ctx).expect("the Navigator");
+        assert!(r.contains(at), "{r:?} round {at:?}");
+        frame(&mut app, vec![key(Key::N, false, Modifiers::NONE)]);
+        assert!(!app.navigator_open);
         // The menu row: open until Esc.
         assert!(crate::ui::menus::run_command(
             &mut app,
@@ -1464,6 +1511,16 @@ mod tests {
         assert_eq!(ids.len(), 3);
         assert_eq!(ids[1], first);
         assert_eq!(ids[2], second);
+        // One undo step each: one Undo takes the page away, where it was
+        // a page added at the end and then moved, two steps.
+        let names: Vec<String> = app.doc().pages.iter().map(|p| p.name.clone()).collect();
+        assert_eq!(app.engine.undo_label(), Some("Insert Page"));
+        app.undo();
+        let left: Vec<_> = app.doc().pages.iter().map(|p| p.id).collect();
+        assert_eq!(left, vec![first, second]);
+        app.redo();
+        let back: Vec<String> = app.doc().pages.iter().map(|p| p.name.clone()).collect();
+        assert_eq!(back, names);
     }
 
     #[test]

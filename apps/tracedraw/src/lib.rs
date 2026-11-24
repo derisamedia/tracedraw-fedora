@@ -18,6 +18,7 @@
 mod action_lines;
 mod ai;
 mod ai_image;
+mod ai_photo;
 mod ai_retry;
 mod ai_vectorize;
 mod anchors;
@@ -32,6 +33,7 @@ mod autocorrect;
 mod barcode;
 pub mod benchmark;
 mod bg_remove;
+mod bg_subject;
 mod bitmap_file;
 mod bitmap_fx;
 mod bitmap_modes;
@@ -48,6 +50,7 @@ mod clipboard;
 mod clone_effect;
 mod color_drop;
 mod color_policy;
+mod combine_files;
 mod color_styles;
 mod comments;
 mod common_shapes;
@@ -72,6 +75,10 @@ mod doc_stats;
 mod documents;
 mod drawing_scale;
 mod drop_files;
+mod draw_inside;
+mod rotate_lines;
+mod grid_handles;
+mod drag_copies;
 mod drop_menu;
 mod effect_line;
 #[cfg(test)]
@@ -84,11 +91,25 @@ mod export;
 mod export_assets;
 mod extrude_tool;
 mod eyedropper;
+mod screen_sample;
 mod file_hold;
 mod file_presence;
 mod files;
 mod fill_page;
+mod shape3d;
+mod dialog_preview;
+mod shape_gen;
+mod shape_gen_bg;
+mod shape_gen_cells;
+mod shape_gen_curves;
+mod shape_gen_fill;
+mod shape_gen_growth;
+mod shape_gen_slice;
+mod shape_gen_tool;
+mod shape_gen_warp;
 mod fill_tool;
+mod pattern_fill_tool;
+mod fit_live;
 mod fit_path;
 mod focus;
 mod formula;
@@ -96,6 +117,9 @@ mod formula;
 mod font_folder;
 #[cfg(not(target_arch = "wasm32"))]
 mod frame_stats;
+#[cfg(not(target_arch = "wasm32"))]
+mod hang_watch;
+mod frame_gen;
 mod frame_type;
 mod fx;
 mod gather_pages;
@@ -109,6 +133,10 @@ mod grammar;
 mod guides;
 mod help;
 #[cfg(test)]
+mod help_scene_list;
+#[cfg(test)]
+mod help_scenes;
+#[cfg(test)]
 mod help_shots;
 mod hunspell;
 mod i18n;
@@ -118,6 +146,8 @@ mod import_place;
 mod imposition;
 #[cfg(test)]
 mod input_method_tests;
+#[cfg(test)]
+mod stress_tests;
 #[cfg(not(target_arch = "wasm32"))]
 mod instance;
 mod interaction;
@@ -129,6 +159,7 @@ mod lens;
 mod live_guides;
 #[cfg(test)]
 mod macos_package;
+mod macro_convert;
 mod macro_forms;
 mod macros;
 mod mcp;
@@ -136,6 +167,9 @@ mod mcp;
 mod mcp_link;
 mod media;
 mod mesh_tool;
+mod color_points;
+mod text_curve;
+mod trace_sketch;
 mod mixed;
 #[cfg(test)]
 mod mockup_tests;
@@ -150,19 +184,35 @@ mod offset_shadow_handle;
 mod ops;
 mod ops2;
 mod opening;
+mod saving;
+mod exporting;
 mod package;
 mod page_drop;
 mod page_names;
 mod painterly_tool;
 mod palette;
 mod palm;
+mod parallel_lines;
 mod pen;
 mod pen_look;
 mod perspective_draw;
+mod pieces;
+mod cut_tools;
 #[cfg(test)]
 mod pick_drag_tests;
 mod picture_mosaic;
 mod picture_plates;
+mod pixel_adjust;
+mod pixel_edit;
+mod pixel_edit_app;
+mod pixel_light;
+mod pixel_liquify;
+mod pixel_ops;
+mod pixel_paint;
+mod pixel_spray;
+mod pixel_surface;
+mod pixel_view;
+mod pixel_warp;
 mod placeholder;
 mod plugins;
 mod pmd_open;
@@ -207,9 +257,11 @@ mod step_merge;
 mod step_repeat;
 mod storage_full;
 mod straighten;
+mod builtin_looks;
 mod style_presets;
 mod styles;
 mod symbol_paste;
+mod separation_view;
 mod symmetry_edit;
 mod system_chars;
 mod system_locale;
@@ -224,6 +276,7 @@ mod templates;
 mod text_editing;
 #[cfg(test)]
 mod text_effect_tests;
+mod text_follow;
 mod text_frames;
 mod text_nodes;
 mod text_path;
@@ -235,6 +288,7 @@ mod theme;
 mod thesaurus;
 mod thumbnails;
 mod time_tracker;
+mod flow;
 #[cfg(any(target_os = "linux", test))]
 mod title_bar;
 mod tools;
@@ -244,10 +298,14 @@ mod touch_modifiers;
 mod touch_taps;
 mod trace;
 mod trace_blend;
+#[cfg(test)]
+mod trace_bench;
 mod trace_fine;
 mod trace_fit;
 mod trace_fonts;
+mod trace_job;
 mod trace_preview;
+mod trace_progress;
 mod trace_strokes;
 mod trace_text;
 mod tracecut;
@@ -261,8 +319,10 @@ mod upscale;
 #[cfg(not(target_arch = "wasm32"))]
 mod upscale_net;
 mod variable_outline;
+mod symbol_scatter;
 mod vector_mosaic;
 mod view;
+mod view_steps;
 mod view_motion;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wayland_copy;
@@ -287,11 +347,20 @@ mod winit_pen_pressure;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "../../../vendor/winit/src/size_bounds.rs"]
 mod winit_size_bounds;
+// The pointer pixels and scale of the same copy on Linux (#2871).
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "../../../vendor/winit/src/cursor_pixels.rs"]
+mod winit_cursor_pixels;
 // The pen pressure of the patched eframe's web layer, with its tests
 // (vendor/README.md, #1410), so that the gate runs them.
 #[cfg(test)]
 #[path = "../../../vendor/eframe/src/web/pen_pressure.rs"]
 mod eframe_web_pen_pressure;
+// The input the patched eframe keeps while the window is minimized,
+// with its tests (vendor/README.md, #3058).
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "../../../vendor/eframe/src/native/pending_input.rs"]
+mod eframe_pending_input;
 // The queue of files macOS asks to open, of the same copy (#646).
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "../../../vendor/winit/src/opened_files.rs"]
@@ -336,10 +405,28 @@ mod winit_frame_input;
 mod winit_android_mouse;
 mod workspace_file;
 
+/// Stack of every thread TraceDraw starts without saying how large
+/// (drawing, opening, saving, export workers), as the main window's
+/// thread has (see build.rs): a drawing of a few hundred groups nested
+/// in one another, which a file may hold, overflowed the 2 MB threads
+/// get by default and ended the program. Only the part used is ever
+/// taken from memory.
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+const THREAD_STACK: &str = "8388608";
+
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+fn roomy_thread_stacks() {
+    // Before any thread starts: the standard library reads it once.
+    if std::env::var_os("RUST_MIN_STACK").is_none() {
+        std::env::set_var("RUST_MIN_STACK", THREAD_STACK);
+    }
+}
+
 /// The desktop program: the window, with the command line's files and
 /// options (see `docs/behavior/about-and-startup.md`).
 #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub fn run() -> eframe::Result<()> {
+    roomy_thread_stacks();
     let args: Vec<String> = std::env::args().skip(1).collect();
     // One window for every start (#646): files given to a start while
     // TraceDraw runs go to its window, in tabs of their own, and this
@@ -372,6 +459,8 @@ pub fn run() -> eframe::Result<()> {
         mcp_link::bridge();
         return Ok(());
     }
+    // A step that takes long is noted in a file; a crash is offered.
+    hang_watch::start();
     // `tracedraw --x11`: the window opens through X11 (XWayland on a
     // Wayland desktop), where a graphics tablet's pen moves the pointer
     // (#850). The patched windowing layer reads a pen on Wayland too
@@ -471,6 +560,7 @@ pub fn run() -> eframe::Result<()> {
             .with_resizable(true)
             .with_title("TraceDraw")
             .with_app_id(splash::APP_ID)
+            .with_icon(splash::window_icon())
     } else {
         splash::main_window_builder(&settings, plain)
     };
@@ -581,6 +671,12 @@ pub fn run() -> eframe::Result<()> {
                 );
                 log::error!("{what}");
                 startup_log::no_window(&what);
+            }
+        } else if let Some(next) = gpu::take_restart_after_exit() {
+            // Help > Benchmark: with or without the graphics card.
+            log::info!("starting again with {next:?} for the benchmark");
+            if !gpu::restart_with(next, &args) {
+                log::error!("TraceDraw could not start again with {next:?}");
             }
         }
         return Ok(());
@@ -945,7 +1041,18 @@ impl eframe::App for Shell {
         // What Android's on-screen keyboard typed (#1309).
         soft_keyboard::take_into(raw_input);
         pen::filter_raw_input(ctx, raw_input);
+        // A text box's right-click menu picked last frame (#3798).
+        ui::text_field_menu::raw_input(raw_input);
         interaction::release_chorded_left(ctx, raw_input);
+        // While a large drawing is written off the interface's thread
+        // nothing typed, clicked or dropped reaches it (#4011).
+        if self
+            .app
+            .as_ref()
+            .is_some_and(|app| app.saving.is_some() || app.exporting.is_some())
+        {
+            saving::hold_input(raw_input);
+        }
         // The screen's safe area on Android (#1917).
         if let Some(app) = self.app.as_ref() {
             ui::screen_margins::apply(ctx, &app.settings, raw_input);
@@ -974,6 +1081,9 @@ impl eframe::App for Shell {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // A frame stuck for long is a hang, reported (hang_watch.rs).
+        #[cfg(not(target_arch = "wasm32"))]
+        let _hang_frame = hang_watch::Frame::begin();
         // The start works once a frame reached the screen, not when the
         // window was made (#1999).
         #[cfg(not(target_arch = "wasm32"))]
@@ -1063,8 +1173,8 @@ impl eframe::App for Shell {
         // What the browser could not keep (#1414).
         app.tell_storage_refusals();
         app.sync_document_colors();
-        // File dialogs that finished in the background (browser build).
-        files::run_finished(app);
+        // File dialogs that finished in the background.
+        files::run_finished(app, ui.ctx());
         // Pictures, files and text a browser handed over for a paste.
         app.take_handed_pastes();
         // Files a later start handed over (one try_recv when none came).
@@ -1084,6 +1194,28 @@ impl eframe::App for Shell {
         // Requests of AI agents for the open drawing (MCP).
         #[cfg(not(target_arch = "wasm32"))]
         if app.sync_mcp_link(ui.ctx()) {
+            ui.ctx().request_repaint();
+        }
+        // Fonts being installed off the interface's thread (d#3200).
+        if app.poll_font_installs() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        // A large drawing being saved off the interface's thread (#4011):
+        // a window closed meanwhile waits for the file.
+        if (app.saving.is_some() || app.exporting.is_some())
+            && ui.ctx().input(|i| i.viewport().close_requested())
+        {
+            app.wait_for_saving();
+            app.wait_for_exporting();
+        }
+        if app.poll_saving() | app.poll_exporting() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        // A large file of another format about to be opened: its notice
+        // is on screen before the reading starts.
+        if app.poll_open_notice() {
             ui.ctx().request_repaint();
         }
         // A large drawing being opened off the interface's thread (#2849).
@@ -1116,8 +1248,13 @@ impl eframe::App for Shell {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
+        // What the program does, for a report of a hang, and a report of
+        // a hang or a crash offered.
+        #[cfg(not(target_arch = "wasm32"))]
+        hang_watch::poll(app);
         frame_mark("before the interface");
         ui::root(app, ui);
+        ui::text_field_menu::show(ui.ctx());
         frame_mark("the dialogs");
         // The frame around the safe area (#1917).
         ui::screen_margins::paint(ui.ctx(), &app.settings);
@@ -1134,6 +1271,13 @@ impl eframe::App for Shell {
         app.refresh_callouts();
         // Blends follow their end objects.
         app.refresh_blends();
+        // Live fits follow their paths and objects.
+        app.refresh_live_fits();
+        // Texts set to follow their paths are fitted again (#3571).
+        app.refresh_text_follow();
+        // Objects of the facing page selected with the current page's go
+        // back to their page once deselected (#3817).
+        app.return_spread_adopted();
         // The window's state is kept once it has settled; until then it
         // is maximized when it should start so, and checked (#787).
         #[cfg(not(target_arch = "wasm32"))]
@@ -1192,6 +1336,8 @@ impl eframe::App for Shell {
     /// session; drawings left unsaved stay backed up for it.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if let Some(app) = self.app.as_mut() {
+            app.wait_for_saving();
+            app.wait_for_exporting();
             app.save_settings();
             app.leave_session();
             // Restart after an update: the new version starts last, when

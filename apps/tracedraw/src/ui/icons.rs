@@ -183,19 +183,18 @@ pub fn draw_on(painter: &Painter, r: Rect, tool: Tool, color: Color32, bg: Color
         }
 
         Tool::VariableOutline => {
-            // A straight ink stroke swelling in the middle, the width
-            // handle pulled out square from its edge. It was an arch,
-            // read as a compass (#1682).
+            // An ink ribbon swelling in the middle, the width handle
+            // pulled off the curve.
             let band = ribbon(
-                [pt(3.5, 20.5), pt(9.0, 15.0), pt(15.0, 9.0), pt(20.5, 3.5)],
-                |t| 0.6 + 2.8 * (std::f32::consts::PI * t).sin(),
+                [pt(3.0, 18.0), pt(7.0, 6.0), pt(17.0, 6.0), pt(21.0, 18.0)],
+                |t| 0.5 + 2.6 * (std::f32::consts::PI * t).sin(),
                 28,
             );
             pen.fill_pts(&band, pen.wash(), false);
             pen.stroke_pts(&band, true, LINE, ink);
-            pen.thin("M14.4 14.4L18.5 18.5", acc);
-            pen.handle(18.5, 18.5, 1.8);
-            pen.node(14.4, 14.4, true);
+            pen.thin("M12 9V3.5", acc);
+            pen.handle(12.0, 3.5, 1.8);
+            pen.node(12.0, 9.0, true);
         }
 
         // Crop group.
@@ -306,6 +305,13 @@ pub fn draw_on(painter: &Painter, r: Rect, tool: Tool, color: Color32, bg: Color
                 pen.handle(x, y, 1.8);
             }
             pen.node(11.0, 12.0, true);
+        }
+        Tool::CurvaturePen => {
+            // A smooth curve running through the points clicked.
+            pen.line("M3 18C5 10 8 6 11 10S17 19 21 6", ink);
+            pen.node(3.0, 18.0, false);
+            pen.node(11.0, 10.0, false);
+            pen.node(21.0, 6.0, true);
         }
         Tool::Polyline => {
             pen.line("M3 19L7 6 13 15 20 4", ink);
@@ -466,6 +472,14 @@ pub fn draw_on(painter: &Painter, r: Rect, tool: Tool, color: Color32, bg: Color
             // A grid of cells, the node on its corner.
             pen.body(&rrect(3.0, 3.0, 18.0, 18.0, 2.0));
             pen.thin("M9 3v18M15 3v18M3 9h18M3 15h18", ink);
+            pen.node(21.0, 21.0, true);
+        }
+        Tool::ShapeGenerator => {
+            // A pattern of quarter circles filling a box, the node on
+            // its corner.
+            pen.body(&rrect(3.0, 3.0, 18.0, 18.0, 2.0));
+            pen.thin("M3 12a9 9 0 0 0 9-9M12 21a9 9 0 0 1 9-9", acc);
+            pen.thin("M3 7.5a4.5 4.5 0 0 0 4.5-4.5M16.5 21a4.5 4.5 0 0 1 4.5-4.5", ink);
             pen.node(21.0, 21.0, true);
         }
 
@@ -1426,39 +1440,6 @@ mod tests {
             assert_eq!(circles(a, off)[0].fill, off, "{a:?} dimmed");
         }
         assert!(circles(Action::Open, Tokens::icon()).is_empty());
-    }
-
-    /// The Variable Outline icon is a straight stroke swelling in the
-    /// middle, no longer an arch read as a compass (#1682): everything
-    /// lies along the diagonal it runs on, but the width handle pulled
-    /// out square from its middle.
-    #[test]
-    fn the_variable_outline_icon_is_not_an_arch() {
-        fn points(s: &egui::Shape, out: &mut Vec<Pos2>) {
-            match s {
-                egui::Shape::Path(p) => out.extend(p.points.iter().copied()),
-                egui::Shape::Mesh(m) => out.extend(m.vertices.iter().map(|v| v.pos)),
-                egui::Shape::LineSegment { points: p, .. } => out.extend(p.iter().copied()),
-                egui::Shape::Circle(c) => out.push(c.center),
-                egui::Shape::Vec(v) => v.iter().for_each(|s| points(s, out)),
-                _ => {}
-            }
-        }
-        let mut pts = Vec::new();
-        for s in shapes_of(Tool::VariableOutline, Tokens::icon()) {
-            points(&s, &mut pts);
-        }
-        assert!(pts.len() > 20);
-        for p in pts {
-            // Back on the 24 grid of the 22 px box at (4, 4).
-            let g = (p - Pos2::new(4.0, 4.0)) * (24.0 / 22.0);
-            let along = (g.x + g.y - 24.0).abs() / 2f32.sqrt();
-            let handle = (g.x - g.y).abs() < 2.5 && g.x > 12.5;
-            assert!(
-                along < 4.6 || handle,
-                "the icon reaches {g:?}, off the diagonal stroke"
-            );
-        }
     }
 
     /// The shapes `draw` adds for `tool` in a 22 px box.

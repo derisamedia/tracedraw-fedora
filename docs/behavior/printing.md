@@ -66,9 +66,25 @@ the printer's paper of its size when the printer has one (either way
 round, within 2 mm), a wide sheet turns the paper, and the sheet is
 drawn at its size from the paper's corner; the copies and their
 collation go to the printer, the drawing's name is the job title. The
-script runs without a window and shows no "Printing page" box, and gives
-up after five minutes; what came of each print (the sheets sent, or the
-error) is written to `tracedraw.log`. A one-sheet print used to fail
+script runs without a window and shows no "Printing page" box. A print
+of any number of sheets goes through (#4053, #4054): each sheet's
+pictures are written to files as it is drawn, up to four sheets at a
+time sharing the 16 million pixels, so only the sheets being drawn are
+in memory (`draw_sheets_to`); the script says a line for each sheet the
+queue takes, read while it runs (`run_watched`), and is given up only
+when it says nothing for five minutes, however long the whole job
+takes. The status bar counts both steps, "Drawing sheet 12 of 2000 for
+the printer…" then "Sending sheet 12 of 2000 to the printer…"
+(`PrintProgress`). Before, all the sheets were drawn into memory first,
+what the script said was read only at its end (so a job of some hundred
+sheets waited for ever to say its next line) and the whole job had five
+minutes, so a print merge of 2000 sheets never printed. What came of
+each print (the last lines the script said, or the error) is written to
+`tracedraw.log`
+(`printers::tests::a_job_that_says_much_is_read_while_it_runs`,
+`printers::tests::only_a_job_gone_silent_is_stopped`,
+`printers::tests::the_print_script_says_each_sheet_sent`,
+`export::tests::many_sheets_are_drawn_into_files_in_their_order`). A one-sheet print used to fail
 before it reached the printer, on every printer: the list of sheet sizes
 flattened in PowerShell when it held one sheet (#614; checked on a
 Windows machine with a printer writing to a file: one and two sheets
@@ -79,9 +95,11 @@ Next to the list a Properties button (a gear, available when a system
 printer is chosen) opens the printer's own settings: on Windows its
 printing preferences (`rundll32 printui.dll,PrintUIEntry /e /n name`),
 on macOS the system's Printers & Scanners settings, on Linux and other
-CUPS systems the printer's page of the CUPS web interface in the browser
-(`http://localhost:631/printers/name`, a web page, not a system dialog;
-`properties_command`). Under
+CUPS systems the printer's own properties window with its driver's
+options (`system-config-printer --configure-printer name`, when the
+desktop has it, #3764), else the printer's page of the CUPS web interface
+in the browser (`http://localhost:631/printers/name`, a web page, not a
+system dialog; `properties_command`). Under
 Orientation, Status, Location and Comment show what the system says of
 the printer chosen (empty for the PDF viewer and the files, #614).
 
@@ -114,7 +132,11 @@ has one.
     at its size, shrunk only when it does not fit and Keep page size is off,
     and the layouts repeat it; #1001, `selection_as_page`,
     `export::tests::the_selection_prints_alone_on_a_page_of_its_size`,
-    `export::tests::keep_size_keeps_the_selection_at_its_size`); and Odd and even pages,
+    `export::tests::keep_size_keeps_the_selection_at_its_size`; with Keep
+    their place on the page ticked under Selection, in the Print dialog
+    and in Print Preview, the selected objects print where they stand on
+    a page the size of the drawing's page instead, #3806,
+    `export::tests::the_selection_can_print_in_its_place_on_the_page`); and Odd and even pages,
     Odd pages or Even pages of the document or the list (#951).
   - Copies: a file gets its copies inside, as whole sets (Collate) or
     each sheet repeated. Reverse order (under Collate) prints the
@@ -148,6 +170,27 @@ has one.
   plate and its box in the print preview; before, the sheets lost the
   list and only the four process plates printed (#779,
   `export::tests::separations_print_a_plate_for_each_spot_ink`).
+  It reaches every spot ink that prints: the master layers' objects,
+  the pages' backgrounds, drop shadows and the colours of effects (a
+  contour's last step, an extrusion's shades, glows and the rest),
+  which kept their spot inks before
+  (`export::tests::spot_to_cmyk_reaches_master_layers_backgrounds_and_effects`).
+  The plates split those colours too: a contour's steps and a drop
+  shadow print as the coverage of each plate's ink and count as ink on
+  their plates; before, they printed in colour on every plate
+  (`export::tests::separations_split_the_colours_of_effects`).
+  Color profile (#3374, Color tab, beside its Intent, Perceptual at
+  first): None, then the RGB and CMYK profiles found on this computer
+  (`color_policy::system_profiles`). With one chosen, composite output
+  (not Grayscale or Separations) converts every colour of the sheets,
+  read as sRGB, to the profile's device values with black point
+  compensation: an RGB profile gives RGB colours, a CMYK one CMYK
+  colours; pictures go pixel by pixel (with a CMYK profile, back to RGB
+  from its CMYK), alpha kept, each colour worked out once. The
+  registration colour stays. The colours are reached as Grayscale
+  reaches them (`export::map_doc_colors`). The choice is kept with the
+  other print choices (`output_profile`, `output_intent`)
+  (`export::tests::a_printer_profile_converts_the_printed_colours`).
   Leave out empty plates (under Separations in the Print dialog and
   under the inks in Print Preview, off at first, kept in presets): each
   sheet's plate that takes no ink does not print; a colour counts on a
@@ -184,13 +227,20 @@ has one.
   (`export::tests::separations_split_pictures_into_their_inks`). Before,
   pictures printed whole on every plate.
 - Composite: Print text in black (fills, outlines and character colours
-  of every text); Always overprint black (100 % black fills and outlines
+  and outlines of every text, on the master layers too,
+  `export::tests::text_in_black_reaches_master_layers_and_character_outlines`);
+  Always overprint black (100 % black fills and outlines
   overprint).
 - Layout: As in document, Fit to page or Scale (percent). Fit to page
-  also brings objects that run off the page inside it: the objects the
-  page shows (every printed one when the range is the selection) shrink
-  as one to fit it, centred, when they do not fit; objects wholly off the
-  page stay out (#534, `fit_contents_to_page`,
+  scales each page to fill the room inside the paper's margins, up or
+  down, keeping its proportions (`imposition::Options::fit`,
+  `imposition::tests::fit_to_page_scales_the_page_to_the_paper`); As in
+  document only shrinks a page too big for the sheet. What runs off a
+  page stays cut at its edge, where it was drawn, on facing pages too:
+  it is not pulled onto the page nor shrunk with the page's objects
+  (#2678, `export::tests::fit_to_page_leaves_what_runs_off_the_page_where_it_is`).
+  With the selection printed, Fit to page shrinks every printed object
+  as one to fit the page, centred (#534, `fit_contents_to_page`,
   `export::tests::fit_to_page_shrinks_what_runs_off_the_page`). Choosing
   Fit to page (here, or ticking it in Print Preview) also puts back a
   page moved or stretched on the sheet in Print Preview: the artwork
@@ -407,7 +457,7 @@ same function (`export::print_sheets`).
 
 - With facing pages each page prints with what its facing page holds
   across the spine and in the bleed beside it (not for the selection
-  alone, nor with Fit to page; see `facing-pages.md`, #1972).
+  alone; see `facing-pages.md`, #1972).
 - Pages keep their aspect ratio; each cell is as large as the largest
   page on its sheet and a smaller page sits in its middle.
 - Gap between pages (several pages per sheet and repeat on the sheet,
@@ -509,6 +559,21 @@ same function (`export::print_sheets`).
   - Gap (default 0, 0 to 100 mm): the space between the two pages of a
     spread, centred on the fold; a fitted sheet grows by it. No bleed is
     kept between the two pages.
+  - Pages per side (#3380, `Booklet::up`): 2 (default, the layout
+    above), 4 or 8. With 4 or 8 each sheet is a large sheet for offset
+    presses, 2 x 2 or 4 x 2 pages a side, that folds into a signature of
+    8 or 16 pages: folded across the rows (the top half behind) and
+    across the columns (the left half behind), 8 pages first across the
+    columns, the last fold the spine. The pages of the top row stand
+    upside down (heads to the fold). 8 pages, front: 5 4 over 8 1; back
+    (turned over side to side): 3 6 over 2 7. 16 pages, front: 5 12 9 8
+    over 4 13 16 1; back: 7 10 11 6 over 2 15 14 3
+    (`imposition::folded_sides`, worked out by folding the sheet).
+    Saddle stitch nests the signatures (the first holds the first and
+    the last pages), perfect binding gathers them in order (one sheet a
+    signature: Sheets per signature and Creep do not show). The page
+    count is rounded up to a multiple of 8 or 16; the fold mark goes on
+    the middle of the sheet.
   - Under the sketch: the pages, the blank pages added and the sheets of
     paper (each printed on both sides), and for perfect binding the
     signatures (`imposition::booklet_info`). The page range (Pages) picks
@@ -585,6 +650,7 @@ With any mark on, a 12 mm margin (plus the bleed) surrounds the pages.
 
 - `imposition::tests::booklets_pair_the_pages_for_folding`
 - `imposition::tests::perfect_binding_folds_each_signature_on_its_own`
+- `imposition::tests::large_sheets_fold_into_signatures_of_8_and_16_pages`
 - `imposition::tests::booklet_gap_and_creep_move_the_pages`
 - `ui::dialogs::booklet_fields_tests::the_binding_pictures_choose_and_the_summary_counts`
 - `ui::dialogs::booklet_fields_tests::the_summary_counts_the_pages_of_the_range`

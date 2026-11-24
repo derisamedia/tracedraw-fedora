@@ -14,7 +14,7 @@ use crate::theme::Tokens;
 use crate::ui::dialogs::{enter_pressed, window};
 use crate::ui::options::{combo, grid, row_label};
 use crate::ui::tips::RichTip;
-use egui::{Context, RichText, Ui};
+use egui::{Context, RichText, Sense, Ui};
 use std::path::{Path, PathBuf};
 use tracedraw_core::document::{TDRAW_FORMAT_VERSION, TDRAW_RELEASES};
 use tracedraw_core::Command;
@@ -105,6 +105,18 @@ pub struct SaveAsState {
     pub bookmarks: Vec<PathBuf>,
     /// The folders used lately, newest first.
     pub recent: Vec<PathBuf>,
+    /// The column the list is sorted by, and whether downwards (#3858).
+    pub sort: (ListSort, bool),
+}
+
+/// A column of the folder list it can be sorted by (#3858).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ListSort {
+    #[default]
+    Name,
+    Modified,
+    Type,
+    Size,
 }
 
 impl SaveAsState {
@@ -207,6 +219,7 @@ impl SaveAsState {
             desktop_bookmarks: Vec::new(),
             bookmarks: app.settings.folder_bookmarks.clone(),
             recent: Vec::new(),
+            sort: (ListSort::Name, false),
         };
         if !files::WEB && !files::ANDROID {
             st.places = files::places();
@@ -441,13 +454,45 @@ impl SaveAsState {
         self.replace = None;
     }
 
-    /// The entries shown: folders, and files of the chosen type.
+    /// The entries shown: folders, and files of the chosen type, folders
+    /// first, sorted by the column chosen (#3858).
     pub fn shown(&self) -> Vec<&DirEntry> {
         let ext = format!(".{}", self.extension());
-        self.entries
+        let mut out: Vec<&DirEntry> = self
+            .entries
             .iter()
             .filter(|e| e.is_dir || e.name.to_ascii_lowercase().ends_with(&ext))
-            .collect()
+            .collect();
+        let (by, down) = self.sort;
+        let kind = |e: &DirEntry| {
+            Path::new(&e.name)
+                .extension()
+                .map(|x| x.to_string_lossy().to_lowercase())
+                .unwrap_or_default()
+        };
+        out.sort_by(|a, b| {
+            let key = match by {
+                ListSort::Name => std::cmp::Ordering::Equal,
+                ListSort::Modified => a.modified.cmp(&b.modified),
+                ListSort::Type => kind(a).cmp(&kind(b)),
+                ListSort::Size => a.size.cmp(&b.size),
+            }
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then(if down { key.reverse() } else { key })
+        });
+        out
+    }
+
+    /// A click on a column's title: sorted by it, the other way round when
+    /// it already was (#3858).
+    pub fn sort_by(&mut self, by: ListSort) {
+        self.sort = if self.sort.0 == by {
+            (by, !self.sort.1)
+        } else {
+            (by, false)
+        };
     }
 }
 
@@ -526,7 +571,51 @@ pub fn version_choices() -> Vec<u16> {
 impl App {
     /// File > Save As: the Save Drawing dialog.
     pub fn save_as_dialog(&mut self) {
+        if self.settings.system_save_dialog && !files::WEB && !files::ANDROID {
+            self.system_save_as();
+            return;
+        }
         self.dialog = crate::ui::dialogs::Dialog::SaveAs(SaveAsState::new(self));
+    }
+
+    /// Save As through the system's save dialog (#2965): the folder and
+    /// name the Save Drawing dialog would offer, TraceDraw and CorelDRAW
+    /// as the types (the drawing's own first), the versions the Options
+    /// set; the system asks before replacing a file.
+    fn system_save_as(&mut self) {
+        let mut st = SaveAsState::new(self);
+        let tdraw = ("TraceDraw (*.tdraw)", TDRAW);
+        let cdr = ("CorelDRAW (*.cdr)", CDR);
+        let (first, second) = if st.cdr { (cdr, tdraw) } else { (tdraw, cdr) };
+        let mut d = files::Dialog::new()
+            .add_filter(first.0, &[first.1])
+            .add_filter(second.0, &[second.1])
+            .set_file_name(st.file_name());
+        if files::is_dir(&st.dir) {
+            d = d.set_directory(st.dir.clone());
+        }
+        d.save_file(self, move |app, path| {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if ext == CDR || ext == TDRAW {
+                st.cdr = ext == CDR;
+            }
+            if let Some(dir) = path.parent() {
+                st.dir = dir.to_path_buf();
+                st.dir_text = st.dir.display().to_string();
+            }
+            st.name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            // The system dialog asked about replacing already.
+            st.package = false;
+            st.replace = Some(st.target());
+            app.finish_save_as(&mut st);
+        });
     }
 
     /// The dialog's Save: check the name and the folder, ask before
@@ -585,13 +674,21 @@ impl App {
                     } else {
                         app.tdraw_embed_fonts = tdraw_embed_fonts;
                         app.tdraw_version = Some(tdraw_version);
-                        app.save_to(path);
+                        app.save_to_showing_progress(path);
                     }
                 });
             return true;
         }
         let path = st.target();
-        if files::exists(&path) && st.replace.as_ref() != Some(&path) {
+        // The file the drawing was opened from (a `.cdr`, say) is the one
+        // Save writes back to: the dialog already showed it, so it is not
+        // asked about again (#3618).
+        let own = self.file.is_none()
+            && self
+                .opened_from
+                .as_deref()
+                .is_some_and(|f| files::same_path(&files::canonical(&path), f));
+        if files::exists(&path) && !own && st.replace.as_ref() != Some(&path) {
             st.replace = Some(path);
             return false;
         }
@@ -614,7 +711,7 @@ impl App {
             if st.packaged() {
                 self.save_package(path, st.package_pdf);
             } else {
-                self.save_to(path);
+                self.save_to_showing_progress(path);
             }
         }
         true
@@ -761,6 +858,10 @@ fn place_name(place: Place, path: &Path) -> String {
         Place::Pictures => tr("dialog.place_pictures"),
         Place::Root => path.display().to_string(),
         Place::Drive => files::drive_name(path),
+        Place::Cloud => path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string()),
     }
 }
 
@@ -797,6 +898,9 @@ pub fn size_text(bytes: u64) -> String {
 }
 
 pub fn dialog(app: &mut App, ctx: &Context, st: &mut SaveAsState, close: &mut bool) {
+    if let Some(dir) = files::take_picked("save-as-folder") {
+        st.open_dir(dir);
+    }
     window(ctx, tr("dialog.save_drawing")).show(ctx, |ui| {
         ui.set_width(WIDTH);
         // No folders in a browser (a download) or on Android (the
@@ -904,7 +1008,8 @@ fn folder_bar(ui: &mut Ui, st: &mut SaveAsState) {
                 st.open_dir(up);
             }
         }
-        let width = ui.available_width() - 120.0;
+        // Room at the right for New folder and Browse.
+        let width = ui.available_width() - 220.0;
         let bar = ui.add(
             egui::TextEdit::singleline(&mut st.dir_text)
                 .id(egui::Id::new("save_as_path"))
@@ -920,6 +1025,17 @@ fn folder_bar(ui: &mut Ui, st: &mut SaveAsState) {
         }
         if ui.button(tr("dialog.new_folder")).clicked() {
             st.new_folder();
+        }
+        // The system's own folder window, for the places only it knows
+        // (Windows libraries, Quick access, cloud folders, #3416).
+        if let files::FolderAction::PickFolder(token) = files::FolderUse::SaveDrawing.action() {
+            if ui
+                .button(tr("options.browse"))
+                .rich_tip(tr("options.browse_tip"))
+                .clicked()
+            {
+                files::pick_folder_into(token, Some(&st.dir), "save-as-folder");
+            }
         }
     });
 }
@@ -1033,13 +1149,34 @@ fn listing(ui: &mut Ui, st: &mut SaveAsState) {
                     .striped(true)
                     .spacing([16.0, 4.0])
                     .show(ui, |ui| {
-                        for head in [
-                            "dialog.col_name",
-                            "dialog.col_modified",
-                            "dialog.col_type",
-                            "dialog.col_size",
+                        // A click on a title sorts by its column (#3858).
+                        for (head, by) in [
+                            ("dialog.col_name", ListSort::Name),
+                            ("dialog.col_modified", ListSort::Modified),
+                            ("dialog.col_type", ListSort::Type),
+                            ("dialog.col_size", ListSort::Size),
                         ] {
-                            ui.label(RichText::new(tr(head)).color(Tokens::text_dim()));
+                            let r = ui.add(
+                                egui::Label::new(RichText::new(tr(head)).color(Tokens::text_dim()))
+                                    .sense(Sense::click()),
+                            );
+                            if st.sort.0 == by {
+                                // A small triangle after the title: up or down.
+                                let c = egui::pos2(r.rect.right() + 7.0, r.rect.center().y);
+                                let d = if st.sort.1 { 1.0 } else { -1.0 } * 3.0;
+                                ui.painter().add(egui::Shape::convex_polygon(
+                                    vec![
+                                        egui::pos2(c.x - 3.5, c.y - d),
+                                        egui::pos2(c.x + 3.5, c.y - d),
+                                        egui::pos2(c.x, c.y + d),
+                                    ],
+                                    Tokens::text_dim(),
+                                    egui::Stroke::NONE,
+                                ));
+                            }
+                            if r.clicked() {
+                                st.sort_by(by);
+                            }
                         }
                         ui.end_row();
                         let picked = st.selected.clone();
@@ -1262,6 +1399,22 @@ fn entry_icon(ui: &mut Ui, folder: bool) {
 /// from right to left), and a name that begins with such a letter sits at
 /// the field's right edge.
 pub fn name_edit(ui: &mut Ui, text: &mut String, id: egui::Id, width: f32) -> egui::Response {
+    name_edit_in(ui, text, id, width, None)
+}
+
+/// [`name_edit`] filling `rect`, as the other fields of a drawn dialog
+/// (the New Document name, #3885).
+pub fn name_edit_at(ui: &mut Ui, rect: egui::Rect, text: &mut String, id: egui::Id) -> egui::Response {
+    name_edit_in(ui, text, id, rect.width(), Some(rect))
+}
+
+fn name_edit_in(
+    ui: &mut Ui,
+    text: &mut String,
+    id: egui::Id,
+    width: f32,
+    rect: Option<egui::Rect>,
+) -> egui::Response {
     let typing = ui.memory(|m| m.has_focus(id));
     let seen = if typing {
         None
@@ -1287,7 +1440,15 @@ pub fn name_edit(ui: &mut Ui, text: &mut String, id: egui::Id, width: f32) -> eg
     if seen.is_some() {
         edit = edit.layouter(&mut layouter);
     }
-    ui.add(edit)
+    match rect {
+        Some(rect) => ui.put(
+            rect,
+            edit.vertical_align(egui::Align::Center)
+                .margin(egui::Margin::symmetric(4, 0))
+                .min_size(rect.size()),
+        ),
+        None => ui.add(edit),
+    }
 }
 
 /// Whether the first letter of `text` is written right to left.
@@ -1645,6 +1806,40 @@ mod tests {
         assert!(!begins_right_to_left("logo \u{5D0}"));
     }
 
+    /// #3885: the New Document name field reads a Hebrew name right to
+    /// left, as the Save Drawing one does.
+    #[test]
+    fn a_field_filling_a_rect_reads_hebrew_right_to_left() {
+        let typed = "\u{5E9}\u{5DC}\u{5D5}\u{5DD} \u{5E2}\u{5D5}\u{5DC}\u{5DD}";
+        let reads = "\u{5DD}\u{5DC}\u{5D5}\u{5E2} \u{5DD}\u{5D5}\u{5DC}\u{5E9}";
+        let ctx = crate::theme::ui_context();
+        let mut name = typed.to_string();
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 100.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                name_edit_at(
+                    ui,
+                    Rect::from_min_size(Pos2::new(10.0, 10.0), vec2(250.0, 24.0)),
+                    &mut name,
+                    egui::Id::new("newdoc_name_field"),
+                );
+            });
+            out.textures_delta.clear();
+            texts.clear();
+            for c in &out.shapes {
+                if let egui::Shape::Text(t) = &c.shape {
+                    texts.push(t.galley.text().to_string());
+                }
+            }
+        }
+        assert!(texts.iter().any(|t| t == reads), "{texts:?}");
+        assert_eq!(name, typed);
+    }
+
     #[test]
     fn save_as_chooses_folder_name_type_version_and_properties() {
         let dir = temp_dir("save-as");
@@ -1814,6 +2009,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// With the system's save dialog chosen, Save As asks the system
+    /// (no Save Drawing dialog), saves in the type of the extension
+    /// chosen there, and goes to that folder next time (#2965).
+    #[test]
+    fn the_system_save_dialog_saves_in_the_type_chosen_there() {
+        let dir = std::env::temp_dir().join(format!("td-system-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let mut app = App::headless();
+        app.settings.system_save_dialog = true;
+        let _ = files::test_save::asked();
+        files::test_save::answer(Some(dir.join("poster.cdr")));
+        app.save_as_dialog();
+        files::test_save::finish(&mut app);
+        assert!(matches!(app.dialog, crate::ui::dialogs::Dialog::None));
+        let asked = files::test_save::asked();
+        assert_eq!(asked.len(), 1);
+        let exts: Vec<String> = asked[0].filters().iter().flat_map(|(_, e)| e.clone()).collect();
+        assert_eq!(exts, ["tdraw", "cdr"]);
+        let bytes = std::fs::read(dir.join("poster.cdr")).expect("saved");
+        // A CorelDRAW file: its RIFF data, alone or in its zip package.
+        let corel = b"application/x-vnd.corel";
+        assert!(bytes.starts_with(b"RIFF") || bytes.windows(corel.len()).any(|w| w == corel));
+        assert_eq!(app.settings.last_dir.as_deref(), Some(dir.as_path()));
+        // Cancel saves nothing.
+        files::test_save::answer(None);
+        app.save_as_dialog();
+        files::test_save::finish(&mut app);
+        assert!(matches!(app.dialog, crate::ui::dialogs::Dialog::None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn names_and_folders_are_checked() {
         let dir = temp_dir("save-as-checks");
@@ -1870,6 +2097,37 @@ mod tests {
         assert_eq!(st.shown().len(), 2);
         assert_eq!(size_text(10), "1 KB");
         assert_eq!(size_text(3 * 1024 * 1024 + 1), "3.0 MB");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #3858: the folder list sorts by the column whose title is
+    /// clicked, the other way round on a second click; folders stay first.
+    #[test]
+    fn the_folder_list_sorts_by_a_column() {
+        let dir = temp_dir("save-as-sort");
+        std::fs::create_dir_all(dir.join("zz")).expect("folder");
+        for (name, len) in [("a.tdraw", 300), ("b.tdraw", 10), ("c.tdraw", 100)] {
+            std::fs::write(dir.join(name), vec![0u8; len]).expect("file");
+        }
+        let mut app = drawing();
+        app.save_as_dialog();
+        let st = state(&mut app);
+        st.open_dir(dir.clone());
+        let names = |st: &SaveAsState| -> Vec<String> {
+            st.shown().iter().map(|e| e.name.clone()).collect()
+        };
+        assert_eq!(names(st), ["zz", "a.tdraw", "b.tdraw", "c.tdraw"]);
+        st.sort_by(ListSort::Size);
+        assert_eq!(names(st), ["zz", "b.tdraw", "c.tdraw", "a.tdraw"]);
+        st.sort_by(ListSort::Size);
+        assert_eq!(names(st), ["zz", "a.tdraw", "c.tdraw", "b.tdraw"]);
+        st.sort_by(ListSort::Name);
+        st.sort_by(ListSort::Name);
+        assert_eq!(names(st), ["zz", "c.tdraw", "b.tdraw", "a.tdraw"]);
+        // The dialog draws with a sorted list.
+        let ctx = crate::theme::ui_context();
+        frame(&ctx, &mut app, false);
+        assert!(matches!(app.dialog, Dialog::SaveAs(_)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2013,8 +2271,21 @@ mod tests {
             st.dir
         );
         assert_eq!(st.name, "card.cdr");
-        // Typed in the bar, not confirmed with Enter: Save writes there.
         let mut st = st.clone();
+        // Saved back over the file it came from, it is not asked about
+        // again (#3618); the drawing then has that file as its own.
+        let mut back = st.clone();
+        assert!(app.finish_save_as(&mut back), "{:?}", back.replace);
+        assert!(back.replace.is_none());
+        assert_eq!(version_of(&path), Some(24));
+        assert!(app.file.is_some());
+        // Another file of that name, not the one it came from, still asks.
+        std::fs::write(work.join("other.cdr"), b"x").expect("written");
+        let mut other_st = st.clone();
+        other_st.name = "other".into();
+        assert!(!app.finish_save_as(&mut other_st));
+        assert!(other_st.replace.is_some());
+        // Typed in the bar, not confirmed with Enter: Save writes there.
         st.dir_text = other.display().to_string();
         st.name = "copy".into();
         assert!(app.finish_save_as(&mut st));

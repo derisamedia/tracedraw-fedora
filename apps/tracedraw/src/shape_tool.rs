@@ -55,6 +55,7 @@ pub(crate) fn frame_only(s: &tracedraw_core::Shape) -> bool {
             e,
             tracedraw_core::live::Effect::Envelope { .. }
                 | tracedraw_core::live::Effect::Perspective { .. }
+                | tracedraw_core::live::Effect::MeshEnvelope { .. }
         )
     })
 }
@@ -158,8 +159,9 @@ impl App {
         let s = self.doc().find_shape(id)?;
         let parent = self.doc().parent_transform(id)?;
         match &s.kind {
-            // A B-spline shows its control points, not its nodes.
-            ShapeKind::Path { .. } if s.spline.is_some() => None,
+            // A B-spline shows its control points, not its nodes, and a
+            // common shape its handles (#4045).
+            ShapeKind::Path { .. } if s.spline.is_some() || shows_handles(s) => None,
             ShapeKind::Path { path, closed } => Some((path.clone(), *closed, parent * s.transform)),
             _ => None,
         }
@@ -218,6 +220,53 @@ impl App {
                 .position(|c| (*c - p).hypot() <= tol)
                 .map(|i| (s.id, i))
         })
+    }
+
+    /// A selected picture's edge under the pointer, away from its
+    /// corners: the picture and the edge (0 to 3, from corner `i` to
+    /// corner `i + 1` in [`bitmap_corners`] order), #3532.
+    fn bitmap_edge_at(&self, p: Point) -> Option<(ShapeId, usize)> {
+        let tol = self.settings.nodes.pick_px() / self.view.zoom as f64;
+        self.selected_shapes().iter().find_map(|s| {
+            if frame_only(s) {
+                return None;
+            }
+            let c = bitmap_corners(s)?;
+            (0..4).find_map(|i| {
+                let (a, b) = (c[i], c[(i + 1) % 4]);
+                let ab = b - a;
+                let len2 = ab.hypot2();
+                if len2 <= 1e-12 {
+                    return None;
+                }
+                let t = (p - a).dot(ab) / len2;
+                let near = (a + ab * t.clamp(0.0, 1.0) - p).hypot() <= tol;
+                let away = (p - a).hypot() > tol && (p - b).hypot() > tol;
+                (near && away && (0.0..=1.0).contains(&t)).then_some((s.id, i))
+            })
+        })
+    }
+
+    /// A press on a selected picture's edge (#3532): the picture goes
+    /// into a clip frame of its rectangle and the edge's two corners are
+    /// chosen and dragged together. False when no edge is at `p`.
+    pub(crate) fn begin_bitmap_edge_crop(&mut self, p: Point) -> bool {
+        let Some((id, edge)) = self.bitmap_edge_at(p) else {
+            return false;
+        };
+        let Some(frame) = self.crop_bitmap_to_frame(id) else {
+            return false;
+        };
+        self.node_selection = vec![(frame, edge), (frame, (edge + 1) % 4)];
+        self.segment_spot = None;
+        self.drag = Drag::NodeMove {
+            start: self.start_curves(),
+            from: p,
+            grab: p,
+            begun: false,
+            still: None,
+        };
+        true
     }
 
     /// Put the picture `id` in a clip frame whose frame is the picture's
@@ -291,17 +340,28 @@ impl App {
         }
     }
 
-    fn set_path(&mut self, id: ShapeId, path: BezPath, closed: bool, label: &'static str) {
-        if self.engine.undo_label() == Some(label) {
-            let _ = self.engine.undo();
-        }
-        let _ = self.engine.run_with_label(
-            &Command::SetShapeKind {
-                shape: id,
-                kind: ShapeKind::Path { path, closed },
-            },
-            label,
-        );
+    /// Give curve `id` the path `path`: the first step of a drag is a new
+    /// undo step named `label`, later steps of the same drag join it.
+    /// Only the drag's own step is joined: an earlier step of the same
+    /// name, another curve's handle drag among them, stays as it was
+    /// (#3689).
+    fn set_path(
+        &mut self,
+        id: ShapeId,
+        path: BezPath,
+        closed: bool,
+        label: &'static str,
+        begun: bool,
+    ) {
+        let cmd = Command::SetShapeKind {
+            shape: id,
+            kind: ShapeKind::Path { path, closed },
+        };
+        let _ = if begun {
+            self.engine.amend(&cmd)
+        } else {
+            self.engine.run_with_label(&cmd, label)
+        };
     }
 
     fn set_path_new_step(&mut self, id: ShapeId, path: BezPath, closed: bool) {
@@ -433,6 +493,79 @@ impl App {
         best.map(|b| b.0)
     }
 
+    /// A step of dragging a rectangle, ellipse, polygon or B-spline node,
+    /// or a common shape's handle (#4045): the object drawn again from
+    /// where the drag began, one undo step for the whole drag. The Shape
+    /// tool and the Common Shapes tool drag them alike.
+    pub(crate) fn kind_node_drag_step(&mut self, p: Point, mods: Modifiers) {
+        let Drag::KindNode {
+            shape,
+            node,
+            start,
+            single,
+            chosen,
+            begun,
+            mut turn,
+        } = self.drag.clone()
+        else {
+            return;
+        };
+        // Ctrl as it is held now, not only at the press: one
+        // corner of a rectangle, an ellipse's angle in steps of
+        // the constrain angle, a star's points keeping their
+        // turn, from the first drag on (#1325, #1331, #1340).
+        let ctrl = mods.ctrl || mods.command;
+        let q = self.snap_point_excluding(p, &[shape]);
+        let step = self.settings.constrain_angle;
+        let cmd = match node {
+            crate::kind_nodes::KindNode::Spline { index } => {
+                let chosen: Vec<usize> = self
+                    .node_selection
+                    .iter()
+                    .filter(|(id, _)| *id == shape)
+                    .map(|(_, i)| *i)
+                    .collect();
+                if chosen.contains(&index) {
+                    crate::kind_nodes::spline_moved_many(&start, &chosen, index, q)
+                } else {
+                    crate::kind_nodes::spline_moved(&start, index, q)
+                }
+                .map(|points| Command::SetSpline {
+                    shape,
+                    points,
+                    fixed: None,
+                })
+            }
+            crate::kind_nodes::KindNode::Adjust { index } => {
+                crate::common_shapes::adjust_command(&start, index, q)
+            }
+            _ => crate::kind_nodes::drag_constrained(
+                &start, node, q, ctrl, chosen, &mut turn, step,
+            )
+            .map(|kind| Command::SetShapeKind { shape, kind }),
+        };
+        // One undo step for the whole drag, begun by the first step that
+        // changes something (a step that changed nothing must not fold
+        // the drag into the step before it).
+        let ran = match cmd {
+            Some(cmd) if begun => self.engine.amend(&cmd).is_ok(),
+            Some(cmd) => self
+                .engine
+                .run_with_label(&cmd, crate::kind_nodes::label_for(&start, Some(node)))
+                .is_ok(),
+            None => false,
+        };
+        self.drag = Drag::KindNode {
+            shape,
+            node,
+            start,
+            single,
+            chosen,
+            begun: begun || ran,
+            turn,
+        };
+    }
+
     pub fn shape_tool_input(&mut self, response: &Response, p: Point, mods: Modifiers) {
         self.drop_hidden_node_choices();
         if response.double_clicked_by(PointerButton::Primary) {
@@ -558,6 +691,12 @@ impl App {
                     return;
                 }
             }
+            // A picture's edge: cropped the same way, the edge's two
+            // corners moving together (Ctrl keeps the move to one axis),
+            // #3532.
+            if self.begin_bitmap_edge_crop(p) {
+                return;
+            }
             if let Some((s, node)) = self.kind_node_at(p) {
                 // A B-spline's control point is chosen as a node is: a
                 // click chooses it alone (unless it is chosen already, so
@@ -678,11 +817,24 @@ impl App {
                     return;
                 }
             }
-            // An edge of a selected polygon or star bends once dragged: it
-            // becomes a curve then (#2451).
+            // An edge of a selected polygon or star: a drag bends all its
+            // sides alike (#2451).
             if let Some(shape) = self.polygon_edge_at(p) {
-                self.drag = Drag::PolygonEdge { shape, from: p };
-                return;
+                let start = self
+                    .doc()
+                    .find_shape(shape)
+                    .map(|s| (s.kind.clone(), s.transform));
+                let parent = self.doc().parent_transform(shape);
+                if let (Some((start, t)), Some(parent)) = (start, parent) {
+                    self.drag = Drag::PolygonEdge {
+                        shape,
+                        from: p,
+                        start,
+                        to_local: (parent * t).inverse(),
+                        begun: false,
+                    };
+                    return;
+                }
             }
             // A marquee over the selected objects' nodes. It keeps the
             // selection, also when it starts over another object (the one
@@ -751,8 +903,44 @@ impl App {
                     };
                 }
                 Drag::NodeMove { .. } => self.node_move_to(p, mods),
+                Drag::PolygonEdge {
+                    shape,
+                    from,
+                    start,
+                    to_local,
+                    begun,
+                } if !matches!(
+                    start,
+                    ShapeKind::Polygon {
+                        complex: Some(_),
+                        ..
+                    }
+                ) =>
+                {
+                    // Every side bends alike as the pointer goes across
+                    // the edge grabbed; one undo step for the drag.
+                    if begun || (p - from).hypot() * self.view.zoom as f64 >= 2.0 {
+                        if let Some(kind) =
+                            crate::kind_nodes::polygon_bent(&start, to_local * from, to_local * p)
+                        {
+                            let cmd = Command::SetShapeKind { shape, kind };
+                            let _ = if begun {
+                                self.engine.amend(&cmd)
+                            } else {
+                                self.engine.run_with_label(&cmd, "Bend Sides")
+                            };
+                        }
+                        self.drag = Drag::PolygonEdge {
+                            shape,
+                            from,
+                            start,
+                            to_local,
+                            begun: true,
+                        };
+                    }
+                }
                 Drag::PolygonEdge { from, .. } => {
-                    // The first move: curve first, then the edge bends.
+                    // A complex star: curve first, then the edge bends.
                     if (p - from).hypot() * self.view.zoom as f64 >= 2.0 {
                         self.drag = Drag::None;
                         if self.polygon_edge_to_curve(from) {
@@ -812,7 +1000,33 @@ impl App {
                     index,
                     which,
                 } => {
-                    if let Some((path, closed, t)) = self.path_of(shape) {
+                    // A handle dragged is not chosen: no ring follows it,
+                    // and none stays once the button is let go. A click
+                    // without a drag chooses it for the arrow keys
+                    // (#2819, #3041, #3042).
+                    self.chosen_handle = None;
+                    // Alt held: the node is dragged by its handle, the
+                    // handle keeping its place about it (#3719).
+                    let by_handle = mods.alt
+                        && self.path_of(shape).is_some_and(|(path, closed, t)| {
+                            let Some(n) = nodes::nodes(&path).into_iter().find(|n| n.index == index)
+                            else {
+                                return false;
+                            };
+                            let tip = match which {
+                                nodes::Which::In => n.ctrl_in,
+                                nodes::Which::Out => n.ctrl_out,
+                            };
+                            let Some(tip) = tip else { return false };
+                            let q = t.inverse() * self.snap_point_excluding(p, &[shape]);
+                            let np = nodes::move_node(&path, index, q - tip);
+                            let begun = self.node_drag_shown.is_some();
+                            self.note_node_drag_step(begun);
+                            self.set_path(shape, np, closed, "Edit Handle", begun);
+                            true
+                        });
+                    let plain = if by_handle { None } else { self.path_of(shape) };
+                    if let Some((path, closed, t)) = plain {
                         // The handle snaps like a node does; Ctrl or Shift
                         // keeps it to the constrain angle about its node,
                         // on the page, and a smooth node's other handle
@@ -830,8 +1044,11 @@ impl App {
                         let lp = t.inverse() * q;
                         let ty = self.node_type_of(shape, index);
                         let np = nodes::move_handle(&path, index, which, lp, ty);
-                        self.note_node_drag_step(self.node_drag_shown.is_some());
-                        self.set_path(shape, np, closed, "Edit Handle");
+                        // The press cleared the page's kept picture: it is
+                        // there from the drag's first step on.
+                        let begun = self.node_drag_shown.is_some();
+                        self.note_node_drag_step(begun);
+                        self.set_path(shape, np, closed, "Edit Handle", begun);
                     }
                 }
                 Drag::NodeMarquee { start, .. } => {
@@ -857,7 +1074,26 @@ impl App {
                                 Ok((_, s)) => s.node_types.clone(),
                                 Err(_) => Default::default(),
                             };
-                            let bent = nodes::bend_segment_with(&path, index, t, d, &chosen);
+                            // Rounded corners beside the segment stay
+                            // round (#3265).
+                            let bent = if self.keeps_rounded_corners()(&path) {
+                                tracedraw_core::corner_cut::bend_keeping_fillets(
+                                    &path,
+                                    index,
+                                    t,
+                                    |p, i, t, map| {
+                                        let chosen = chosen
+                                            .iter()
+                                            .filter_map(|(k, v)| {
+                                                Some((map.get(*k).copied().flatten()?, *v))
+                                            })
+                                            .collect();
+                                        nodes::bend_segment_with(p, i, t, d, &chosen)
+                                    },
+                                )
+                            } else {
+                                nodes::bend_segment_with(&path, index, t, d, &chosen)
+                            };
                             let cmd = Command::SetShapeKind {
                                 shape,
                                 kind: ShapeKind::Path { path: bent, closed },
@@ -880,67 +1116,7 @@ impl App {
                         begun: true,
                     };
                 }
-                Drag::KindNode {
-                    shape,
-                    node,
-                    start,
-                    single,
-                    chosen,
-                    begun,
-                    mut turn,
-                } => {
-                    // Ctrl as it is held now, not only at the press: one
-                    // corner of a rectangle, an ellipse's angle in steps of
-                    // the constrain angle, a star's points keeping their
-                    // turn, from the first drag on (#1325, #1331, #1340).
-                    let ctrl = mods.ctrl || mods.command;
-                    let q = self.snap_point_excluding(p, &[shape]);
-                    let step = self.settings.constrain_angle;
-                    let cmd = match node {
-                        crate::kind_nodes::KindNode::Spline { index } => {
-                            let chosen: Vec<usize> = self
-                                .node_selection
-                                .iter()
-                                .filter(|(id, _)| *id == shape)
-                                .map(|(_, i)| *i)
-                                .collect();
-                            if chosen.contains(&index) {
-                                crate::kind_nodes::spline_moved_many(&start, &chosen, index, q)
-                            } else {
-                                crate::kind_nodes::spline_moved(&start, index, q)
-                            }
-                            .map(|points| Command::SetSpline {
-                                shape,
-                                points,
-                                fixed: None,
-                            })
-                        }
-                        _ => crate::kind_nodes::drag_constrained(
-                            &start, node, q, ctrl, chosen, &mut turn, step,
-                        )
-                        .map(|kind| Command::SetShapeKind { shape, kind }),
-                    };
-                    if let Some(cmd) = cmd {
-                        // One undo step for the whole drag.
-                        let _ = if begun {
-                            self.engine.amend(&cmd)
-                        } else {
-                            self.engine.run_with_label(
-                                &cmd,
-                                crate::kind_nodes::label_for(&start, Some(node)),
-                            )
-                        };
-                    }
-                    self.drag = Drag::KindNode {
-                        shape,
-                        node,
-                        start,
-                        single,
-                        chosen,
-                        begun: true,
-                        turn,
-                    };
-                }
+                Drag::KindNode { .. } => self.kind_node_drag_step(p, mods),
                 _ => {}
             }
         }
@@ -1060,6 +1236,11 @@ impl App {
         // the Shape tool's chooses those of a selected mesh too (#2506).
         if self.tool == crate::tools::Tool::MeshFill {
             self.choose_mesh_nodes_in(r, keeps);
+            return;
+        }
+        // The Envelope tool's box chooses envelope nodes (#3001).
+        if self.tool == crate::tools::Tool::Envelope {
+            self.choose_envelope_nodes_in(r, keeps);
             return;
         }
         if self.selected_mesh().is_some() {
@@ -1276,6 +1457,34 @@ impl App {
         self.choose_nodes_at(&spots);
     }
 
+    /// Object > Nodes > Add Node to Every Segment: a node in the middle of
+    /// every segment of the selected curves (their shape unchanged), with
+    /// any tool; one undo step. Run again, it halves the segments again.
+    pub fn add_node_every_segment(&mut self) {
+        let mut cmds = Vec::new();
+        for id in self.selection.clone() {
+            let Some((path, closed, _)) = self.path_of(id) else {
+                continue;
+            };
+            let more = nodes::add_node_every_segment(&path);
+            if more.elements().len() > path.elements().len() {
+                cmds.push(Command::SetShapeKind {
+                    shape: id,
+                    kind: ShapeKind::Path { path: more, closed },
+                });
+            }
+        }
+        if !cmds.is_empty() {
+            let _ = self.engine.run_batch("Add Node to Every Segment", &cmds);
+            self.node_selection.clear();
+        }
+    }
+
+    /// Whether Add Node to Every Segment has a curve to work on.
+    pub fn can_add_node_every_segment(&self) -> bool {
+        self.selection.iter().any(|id| self.path_of(*id).is_some())
+    }
+
     /// Align Nodes: move the selected nodes onto a common horizontal and/or vertical.
     pub fn align_selected_nodes(&mut self, horizontal: bool, vertical: bool) {
         let sel = self.node_selection.clone();
@@ -1405,9 +1614,24 @@ impl App {
             .filter(|k| self.handle_point(*k).is_some())
     }
 
-    /// Where the chosen control handle is, on the page (drawn ringed).
-    pub(crate) fn chosen_handle_point(&self) -> Option<Point> {
-        self.handle_point(self.chosen_handle()?)
+    /// The chosen control handle's node and tip, on the page: the ring
+    /// goes round the handle's head, which points from the node to the
+    /// tip (#3041).
+    /// While a handle is dragged the ring stays on it, as long as the
+    /// button is held, and goes when it is let go (#3141).
+    pub(crate) fn chosen_handle_ends(&self) -> Option<(Point, Point)> {
+        let dragged = match self.drag {
+            Drag::Handle {
+                shape,
+                index,
+                which,
+            } if self.tool == crate::tools::Tool::Shape => Some((shape, index, which)),
+            _ => None,
+        };
+        let key = dragged.or_else(|| self.chosen_handle())?;
+        let (path, _, t) = self.path_of(key.0)?;
+        let n = nodes::nodes(&path).into_iter().find(|n| n.index == key.1)?;
+        Some((t * n.pos, self.handle_point(key)?))
     }
 
     /// Move the chosen control handle by `d` (page millimetres), one undo
@@ -1512,8 +1736,7 @@ impl App {
             if let Err(e) = self.engine.run_batch("Delete Nodes", &cmds) {
                 self.status = e.to_string();
             }
-            self.selection
-                .retain(|id| self.engine.document().find_shape(*id).is_some());
+            self.engine.document().retain_existing(&mut self.selection);
         }
         // The chosen nodes of a curve go together: neighbouring ones
         // become one curve keeping the outline's shape (#675).
@@ -1741,6 +1964,14 @@ impl App {
         self.for_each_selected_node("To Curve", nodes::to_curve);
     }
 
+    /// Bulge: the segments ending at the chosen nodes bow into arcs by
+    /// the bar's percentage, outward on a closed curve, as a rectangle's
+    /// Edge Bulge bows its sides; one undo step (#3335).
+    pub fn bulge_selected_segments(&mut self) {
+        let amount = self.segment_bulge / 100.0;
+        self.for_each_selected_node("Bulge", |p, i| nodes::bulge(p, i, amount));
+    }
+
     pub fn break_selected_nodes(&mut self) {
         // All of a curve's chosen nodes at once: opening a closed subpath
         // turns it to start at the break, which moves the other nodes.
@@ -1858,7 +2089,7 @@ impl App {
     }
 
     /// After a node edit, choose the nodes now sitting at `spots`, so the
-    /// result stays chosen as in CorelDRAW (#2358): the joined node after
+    /// result stays chosen (#2358): the joined node after
     /// Join, both ends after Break, the nodes left after Reduce Nodes.
     pub(crate) fn choose_nodes_at(&mut self, spots: &[(ShapeId, Point)]) {
         let mut sel = Vec::new();
@@ -2190,7 +2421,36 @@ impl App {
                 }
                 continue;
             }
-            if matches!(s.kind, ShapeKind::Bitmap { .. } | ShapeKind::Group { .. }) {
+            if let ShapeKind::Bitmap {
+                rect,
+                width_px,
+                height_px,
+                fx,
+                png,
+            } = &s.kind
+            {
+                // A picture loses its pixels along the nib, the edge
+                // fading out by the bar's hardness and strength (#3043).
+                let nib = SoftNib {
+                    radius: self.eraser_width / 2.0,
+                    hardness: self.eraser_hardness,
+                    strength: self.eraser_strength,
+                };
+                if let Some(png) = erase_picture(&s, png.as_slice(), points, nib) {
+                    cmds.push(Command::SetShapeKind {
+                        shape: s.id,
+                        kind: ShapeKind::Bitmap {
+                            rect: *rect,
+                            width_px: *width_px,
+                            height_px: *height_px,
+                            png,
+                            fx: fx.clone(),
+                        },
+                    });
+                }
+                continue;
+            }
+            if matches!(s.kind, ShapeKind::Group { .. }) {
                 continue;
             }
             let page_path = s.page_path();
@@ -2242,6 +2502,156 @@ impl App {
             let _ = self.engine.run_batch("Eraser", &cmds);
         }
     }
+}
+
+/// The Eraser's nib on a picture (#3043): `radius` mm, erased fully
+/// within `hardness` of it and fading out to its edge, `strength` the
+/// most it takes of a pixel.
+#[derive(Debug, Clone, Copy)]
+pub struct SoftNib {
+    pub radius: f64,
+    pub hardness: f64,
+    pub strength: f64,
+}
+
+impl SoftNib {
+    /// How much is erased at `d` mm from the nib's middle line (0 to 1).
+    pub fn amount(&self, d: f64) -> f64 {
+        let r = self.radius.max(1e-6);
+        if d >= r {
+            return 0.0;
+        }
+        let core = r * self.hardness.clamp(0.0, 1.0);
+        let k = if d <= core {
+            1.0
+        } else {
+            let t = ((r - d) / (r - core).max(1e-9)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+        k * self.strength.clamp(0.0, 1.0)
+    }
+}
+
+/// The picture `s` (its pixels `png`, PNG or JPEG) with the pixels along
+/// `points` (page space) erased by `nib`: their alpha goes down by the
+/// nib's amount at their middles' distance from the line. `None` when
+/// the line misses the picture or it cannot be read.
+pub fn erase_picture(
+    s: &tracedraw_core::document::Shape,
+    png: &[u8],
+    points: &[Point],
+    nib: SoftNib,
+) -> Option<tracedraw_core::SharedBytes> {
+    let ShapeKind::Bitmap {
+        rect,
+        width_px,
+        height_px,
+        ..
+    } = &s.kind
+    else {
+        return None;
+    };
+    let (w, h) = (*width_px as usize, *height_px as usize);
+    if w == 0 || h == 0 || rect.width() <= 0.0 || rect.height() <= 0.0 || points.is_empty() {
+        return None;
+    }
+    // Pixel (x, y) (its middle at x + 0.5, y + 0.5; row 0 at the top) to
+    // the page, and back.
+    let to_page = s.transform
+        * tracedraw_core::geometry::Affine::new([
+            rect.width() / w as f64,
+            0.0,
+            0.0,
+            -rect.height() / h as f64,
+            rect.x0,
+            rect.y1,
+        ]);
+    if to_page.determinant().abs() < 1e-18 {
+        return None;
+    }
+    let to_px = to_page.inverse();
+    let r = nib.radius.max(1e-6);
+    let mut segs: Vec<(Point, Point)> = points.windows(2).map(|w| (w[0], w[1])).collect();
+    if segs.is_empty() {
+        segs.push((points[0], points[0]));
+    }
+    let mut amount: Option<Vec<f32>> = None;
+    for (a, b) in segs {
+        let lo = Point::new(a.x.min(b.x) - r, a.y.min(b.y) - r);
+        let hi = Point::new(a.x.max(b.x) + r, a.y.max(b.y) + r);
+        let corners = [
+            to_px * lo,
+            to_px * hi,
+            to_px * Point::new(lo.x, hi.y),
+            to_px * Point::new(hi.x, lo.y),
+        ];
+        let x0 = corners
+            .iter()
+            .map(|c| c.x)
+            .fold(f64::INFINITY, f64::min)
+            .floor()
+            .max(0.0);
+        let x1 = corners
+            .iter()
+            .map(|c| c.x)
+            .fold(f64::NEG_INFINITY, f64::max)
+            .ceil()
+            .min(w as f64);
+        let y0 = corners
+            .iter()
+            .map(|c| c.y)
+            .fold(f64::INFINITY, f64::min)
+            .floor()
+            .max(0.0);
+        let y1 = corners
+            .iter()
+            .map(|c| c.y)
+            .fold(f64::NEG_INFINITY, f64::max)
+            .ceil()
+            .min(h as f64);
+        if x0 >= x1 || y0 >= y1 {
+            continue;
+        }
+        let buf = amount.get_or_insert_with(|| vec![0.0; w * h]);
+        let ab = b - a;
+        let len2 = ab.hypot2();
+        for y in y0 as usize..y1 as usize {
+            for x in x0 as usize..x1 as usize {
+                let p = to_page * Point::new(x as f64 + 0.5, y as f64 + 0.5);
+                let t = if len2 > 1e-18 {
+                    ((p - a).dot(ab) / len2).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let d = (p - (a + ab * t)).hypot();
+                let k = nib.amount(d) as f32;
+                let cell = &mut buf[y * w + x];
+                if k > *cell {
+                    *cell = k;
+                }
+            }
+        }
+    }
+    let amount = amount?;
+    if amount.iter().all(|k| *k <= 0.0) {
+        return None;
+    }
+    let mut img = image::load_from_memory(png).ok()?.to_rgba8();
+    if img.width() as usize != w || img.height() as usize != h {
+        img = image::imageops::resize(
+            &img,
+            w as u32,
+            h as u32,
+            image::imageops::FilterType::Triangle,
+        );
+    }
+    for (i, px) in img.pixels_mut().enumerate() {
+        let k = amount[i];
+        if k > 0.0 {
+            px[3] = (px[3] as f32 * (1.0 - k)).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    crate::bitmap_fx::encode(&img).map(tracedraw_core::SharedBytes::from)
 }
 
 /// What the Eraser leaves of a clip frame's frame.
@@ -2296,7 +2706,14 @@ fn erase_frame(
     f.node_types.clear();
     f.spline = None;
     f.spline_fixed.clear();
+    f.common_shape = None;
     Erased::Into(Box::new(f))
+}
+
+/// Whether the curve `s` shows a common shape's handles instead of its
+/// nodes (#4045).
+pub(crate) fn shows_handles(s: &Shape) -> bool {
+    s.common_shape.is_some() && crate::common_shapes::live(s).is_some()
 }
 
 #[cfg(test)]
@@ -2384,6 +2801,48 @@ mod constrain_tests {
         let mut d = Vec2::new(3.0, 4.0);
         constrain_axis(&mut d, None);
         assert_eq!((d.x, d.y), (3.0, 4.0));
+    }
+}
+
+#[cfg(test)]
+mod bulge_tests {
+    use super::*;
+    use tracedraw_core::geometry::Rect;
+
+    /// A rectangle converted to curves still bows (#3335): its chosen
+    /// segments bulge by the bar's percentage in one undo step, its
+    /// nodes staying, and 100 % all round makes the circle through them.
+    #[test]
+    fn a_converted_rectangle_bulges_like_a_live_one() {
+        let mut app = App::headless();
+        app.show_welcome = false;
+        let id = app
+            .new_shape(ShapeKind::Rect {
+                rect: Rect::new(0.0, 0.0, 20.0, 20.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .unwrap();
+        app.select(vec![id]);
+        app.convert_to_curves();
+        let before = app.doc().find_shape(id).unwrap().bounds();
+        let Some((path, _, _)) = app.path_of(id) else {
+            panic!("a curve");
+        };
+        let n = path.elements().len();
+        app.node_selection = (0..n).map(|i| (id, i)).collect();
+        app.segment_bulge = 100.0;
+        app.bulge_selected_segments();
+        assert_eq!(app.engine.undo_label(), Some("Bulge"), "one step");
+        let s = app.doc().find_shape(id).unwrap();
+        let b = s.bounds();
+        // The circle through the corners: 20 * sqrt(2) across.
+        let across = 20.0 * 2f64.sqrt();
+        assert!((b.width() - across).abs() < 0.2, "{b:?} from {before:?}");
+        assert!((b.height() - across).abs() < 0.2, "{b:?}");
+        app.engine.undo().unwrap();
+        let b = app.doc().find_shape(id).unwrap().bounds();
+        assert!((b.width() - 20.0).abs() < 1e-6, "{b:?}");
     }
 }
 
@@ -2798,6 +3257,40 @@ mod bitmap_node_tests {
         assert_eq!(chosen, indices);
     }
 
+    /// A press on a picture's edge (away from its corners) crops it from
+    /// that side: the top edge dragged down leaves the picture below it,
+    /// unstretched (#3532).
+    #[test]
+    fn an_edge_of_a_picture_drags_to_crop_it() {
+        let mut app = App::headless();
+        let id = picture(&mut app);
+        app.select(vec![id]);
+        app.view.zoom = 1.0;
+        // Near a corner it is the corner, in the middle of a side an edge.
+        assert_eq!(app.bitmap_edge_at(Point::new(10.5, 10.5)), None);
+        assert_eq!(app.bitmap_edge_at(Point::new(30.0, 40.2)), Some((id, 2)));
+        assert_eq!(app.bitmap_edge_at(Point::new(30.0, 25.0)), None);
+        assert!(app.begin_bitmap_edge_crop(Point::new(30.0, 40.0)));
+        let start = app.start_curves();
+        app.move_start_nodes(&start, Vec2::new(0.0, -15.0), Point::new(30.0, 25.0), false);
+        let s = app.doc().find_shape(id).expect("clip frame");
+        let ShapeKind::ClipFrame { frame, contents } = &s.kind else {
+            panic!("not a clip frame: {:?}", s.kind);
+        };
+        let b = tracedraw_core::geometry::Shape::bounding_box(&frame.page_path());
+        assert!(
+            (b.y1 - 25.0).abs() < 1e-9 && (b.y0 - 10.0).abs() < 1e-9,
+            "{b:?}"
+        );
+        assert!((b.x0 - 10.0).abs() < 1e-9 && (b.x1 - 50.0).abs() < 1e-9);
+        // The picture itself keeps its size.
+        let ShapeKind::Bitmap { rect, .. } = &contents[0].kind else {
+            panic!("picture");
+        };
+        assert_eq!(*rect, Rect::new(10.0, 10.0, 50.0, 40.0));
+        assert!(!app.begin_bitmap_edge_crop(Point::new(500.0, 500.0)));
+    }
+
     /// #1491: a picture with a gradient transparency, cut down by moving
     /// two of its corner nodes with the Shape tool, keeps its
     /// transparency where it lay on the page: the ramp is cut, not
@@ -2895,4 +3388,130 @@ fn every_subpath_closed(p: &BezPath) -> bool {
         }
     }
     any && !open
+}
+
+#[cfg(test)]
+mod soft_eraser_tests {
+    use super::*;
+    use tracedraw_core::geometry::Rect;
+
+    /// The Eraser over a picture takes its pixels away along the nib,
+    /// fully in the middle and fading out to the edge, in one undo step;
+    /// the picture stays a picture of the same size (#3043: pictures could
+    /// not be erased at all).
+    #[test]
+    fn the_eraser_fades_a_picture_out_along_the_nib() {
+        let mut app = App::headless();
+        // 100 x 100 mm at 1 pixel a millimetre, opaque red.
+        let img = image::RgbaImage::from_pixel(100, 100, image::Rgba([255, 0, 0, 255]));
+        let png = crate::bitmap_fx::encode(&img).expect("png");
+        let id = app
+            .new_shape(ShapeKind::Bitmap {
+                rect: Rect::new(0.0, 0.0, 100.0, 100.0),
+                width_px: 100,
+                height_px: 100,
+                png: png.into(),
+                fx: None,
+            })
+            .expect("picture");
+        app.select(vec![id]);
+        app.eraser_width = 20.0;
+        app.eraser_hardness = 0.5;
+        app.eraser_strength = 1.0;
+        let depth = app.engine.history_labels().0.len();
+        // Across the picture at y = 50.
+        app.erase_along(&[Point::new(-10.0, 50.0), Point::new(110.0, 50.0)]);
+        assert_eq!(app.engine.history_labels().0.len(), depth + 1, "one step");
+        let s = app.doc().find_shape(id).expect("still there");
+        let ShapeKind::Bitmap {
+            width_px,
+            height_px,
+            png,
+            ..
+        } = &s.kind
+        else {
+            panic!("still a picture: {:?}", s.kind);
+        };
+        assert_eq!((*width_px, *height_px), (100, 100));
+        let out = image::load_from_memory(png.as_slice())
+            .expect("decode")
+            .to_rgba8();
+        // Row y holds page y = 99.5 - y: the line at page y 50 is between
+        // rows 49 and 50.
+        let alpha = |page_y: f64| out.get_pixel(50, (99.5 - page_y) as u32)[3];
+        assert_eq!(alpha(50.5), 0, "the middle goes");
+        assert_eq!(alpha(54.5), 0, "within the hard core (5 mm)");
+        let soft = alpha(57.5);
+        assert!(soft > 0 && soft < 255, "the edge fades: {soft}");
+        assert!(alpha(58.5) > soft, "fading out");
+        assert_eq!(alpha(70.5), 255, "beyond the nib");
+        assert_eq!(out.get_pixel(50, 10)[0], 255, "the colour stays");
+        // Half strength: never below half.
+        app.eraser_strength = 0.5;
+        app.erase_along(&[Point::new(50.0, -10.0), Point::new(50.0, 110.0)]);
+        let s = app.doc().find_shape(id).expect("picture");
+        let ShapeKind::Bitmap { png, .. } = &s.kind else {
+            panic!();
+        };
+        let out = image::load_from_memory(png.as_slice())
+            .expect("decode")
+            .to_rgba8();
+        let a = out.get_pixel(50, 10)[3];
+        assert!((126..=129).contains(&a), "half taken: {a}");
+        // The nib's amount: full inside, smooth to the edge.
+        let nib = SoftNib {
+            radius: 10.0,
+            hardness: 0.0,
+            strength: 1.0,
+        };
+        assert!((nib.amount(0.0) - 1.0).abs() < 1e-9);
+        assert!((nib.amount(5.0) - 0.5).abs() < 1e-9);
+        assert_eq!(nib.amount(10.0), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod every_segment_tests {
+    use crate::app::App;
+    use tracedraw_core::geometry::{BezPath, Rect};
+    use tracedraw_core::ShapeKind;
+
+    /// Object > Nodes > Add Node to Every Segment, with the Pick tool: a
+    /// node in the middle of each segment of the selected curve, one undo
+    /// step; a rectangle (not a curve) leaves the command off.
+    #[test]
+    fn every_segment_of_the_selected_curves_gets_a_node() {
+        let mut app = App::headless();
+        let r = app
+            .new_shape(ShapeKind::Rect {
+                rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect");
+        app.select(vec![r]);
+        assert!(!app.can_add_node_every_segment());
+        let mut p = BezPath::new();
+        p.move_to((0.0, 0.0));
+        p.line_to((10.0, 0.0));
+        p.line_to((10.0, 10.0));
+        let id = app
+            .new_shape(ShapeKind::Path {
+                path: p,
+                closed: false,
+            })
+            .expect("curve");
+        app.select(vec![id]);
+        assert!(app.can_add_node_every_segment());
+        let len = |app: &App| match &app.doc().find_shape(id).expect("curve").kind {
+            ShapeKind::Path { path, .. } => path.elements().len(),
+            _ => 0,
+        };
+        app.add_node_every_segment();
+        assert_eq!(len(&app), 5);
+        app.add_node_every_segment();
+        assert_eq!(len(&app), 9);
+        app.undo();
+        assert_eq!(len(&app), 5);
+    }
 }

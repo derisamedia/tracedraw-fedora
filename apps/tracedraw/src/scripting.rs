@@ -19,6 +19,7 @@
 mod extra;
 pub mod vba_run;
 mod vg;
+pub mod vg_catalog;
 
 use crate::app::App;
 use boa_engine::{
@@ -53,6 +54,9 @@ struct HostInner {
     status: Option<String>,
     /// View > Simulate Overprints as a macro set it (`ActiveView.Type`).
     simulate_overprints: Option<bool>,
+    /// The view steps a script asked for (#4020), taken once its objects
+    /// are in the drawing.
+    view_steps: Vec<crate::view_steps::ViewStep>,
     /// What a macro's `Copy` or `Cut` took, for its `Paste`: the macro's
     /// own, not the system clipboard, which macros do not reach.
     clip: Vec<Shape>,
@@ -170,6 +174,8 @@ class Shape {
   get Italic() { return __call('shape_info', {id:this.id}).italic; }
   set Italic(i) { __call('set_text_style', {id:this.id, italic:!!i}); }
   SetTextStyle(style) { __call('set_text_style', {id:this.id, ...style}); }
+  get TextBackground() { const c = __call('shape_info', {id:this.id}).background; return c ? new Color(c) : null; }
+  set TextBackground(c) { __call('set_text_style', {id:this.id, background: c ? {fill:'solid', ...c.v} : null}); }
   SetPosition(x, y) { __call('set_position', {id:this.id, x:x, y:y}); }
   SetSize(w, h) { __call('set_size', {id:this.id, w:w, h:h}); }
   Move(dx, dy) { __call('move', {id:this.id, dx:dx, dy:dy}); }
@@ -194,6 +200,12 @@ class Shape {
   // A dimension's kind, value (mm or degrees), label and points; null
   // for other objects.
   get Dimension() { try { return __call('dimension_info', {id:this.id}); } catch (e) { return null; } }
+  // A dimension's style: the settings named as a style is saved
+  // (text_size in points, font, precision...), as the Dimension bar
+  // sets them; LabelSize is the label's size in points (#4026).
+  SetDimensionStyle(style) { return __call('set_dimension_style', {ids:[this.id], style:style}).count; }
+  get LabelSize() { const s = __call('dimension_style', {id:this.id}); return s ? s.text_size : null; }
+  set LabelSize(v) { this.SetDimensionStyle({text_size:Number(v)}); }
   get Children() { return __call('shape_children', {id:this.id}).children.map(c => Object.assign(new Shape(c.id), {IsText:c.is_text, ChildType:c.type, Box:c.bbox})); }
   CreateSymbol(name) { return __call('create_symbol', {ids:[this.id], name:name||''}); }
   // Every group that draws the same as this one (text aside) becomes an
@@ -276,6 +288,9 @@ class ShapeRange {
   DistributeSpacingHorizontally() { this.Distribute('spacing_h'); }
   DistributeSpacingVertically() { this.Distribute('spacing_v'); }
   CreateSelection() { __call('select', {ids:this.ids, add:false}); }
+  // The dimensions among these objects take the style's settings (#4026).
+  SetDimensionStyle(style) { return __call('set_dimension_style', {ids:this.ids, style:style}).count; }
+  set LabelSize(v) { this.SetDimensionStyle({text_size:Number(v)}); }
   CreateSymbol(name) { return __call('create_symbol', {ids:this.ids, name:name||''}); }
   ReplaceText(needle, replacement, options) {
     const o = options || {};
@@ -397,6 +412,10 @@ const Application = {
   get Version() { return __call('version', {}).version; },
   get Name() { return 'TraceDraw'; },
   CreateColor: Color,
+  ZoomToFit() { __call('view_step', {step:'fit_all'}); },
+  ZoomToPage() { __call('view_step', {step:'fit_page'}); },
+  ZoomToSelection() { __call('view_step', {step:'fit_selection'}); },
+  CopyVisibleArea() { __call('view_step', {step:'copy_visible_area'}); },
 };
 // The active document, page and layer are read when a script uses them, not
 // bound once: a script that activates another page would otherwise go on
@@ -447,13 +466,14 @@ fn host_for(app: &App, trust: Trust) -> HostInner {
         selection: app.selection.clone(),
         commands: Vec::new(),
         output: Vec::new(),
-        next_id: app.engine.document().ids().peek_next(),
+        next_id: app.engine.ids().peek_next(),
         trust,
         file: app.file.as_ref().map(|f| f.display().to_string()),
         vg: false,
         view: vg::AppView::of(app),
         status: None,
         simulate_overprints: None,
+        view_steps: Vec::new(),
         clip: Vec::new(),
         dims: DimSettings {
             style: app.dimension_style.clone(),
@@ -606,7 +626,11 @@ fn run_host(
     if let Some(on) = inner.simulate_overprints {
         app.simulate_overprints = on;
     }
+    let views = inner.view_steps;
     apply(app, inner.commands, inner.selection, inner.page, label);
+    for step in views {
+        app.run_view_step(step);
+    }
     Ok((output, changes))
 }
 
@@ -794,6 +818,7 @@ fn blank_host(doc: Document, trust: Trust) -> HostInner {
         view: vg::AppView::default(),
         status: None,
         simulate_overprints: None,
+        view_steps: Vec::new(),
         clip: Vec::new(),
         dims: DimSettings::default(),
     }
@@ -1328,6 +1353,15 @@ impl HostInner {
         }
         Ok(match method {
             "version" => json!({"version": env!("CARGO_PKG_VERSION")}),
+            // Zoom To Fit, Zoom To Page, Zoom To Selection and Copy
+            // Visible Area (#4020).
+            "view_step" => {
+                let name = a.get("step").and_then(|v| v.as_str()).unwrap_or("");
+                let step = crate::view_steps::ViewStep::from_name(name)
+                    .ok_or_else(|| format!("no view step {name:?}"))?;
+                self.view_steps.push(step);
+                json!({})
+            }
             "log" => {
                 self.output.push(
                     a.get("text")
@@ -1642,6 +1676,10 @@ impl HostInner {
                     "size_pt": style.as_ref().map(|sp| sp.size_pt),
                     "bold": style.as_ref().map(|sp| sp.bold),
                     "italic": style.as_ref().map(|sp| sp.italic),
+                    "background": style
+                        .as_ref()
+                        .and_then(|sp| sp.background.as_ref())
+                        .and_then(|f| f.preview_color()),
                 })
             }
             "set_text_style" => {
@@ -1662,7 +1700,23 @@ impl HostInner {
                 let size = a.get("size").and_then(|v| v.as_f64());
                 let bold = a.get("bold").and_then(|v| v.as_bool());
                 let italic = a.get("italic").and_then(|v| v.as_bool());
-                if font.is_none() && size.is_none() && bold.is_none() && italic.is_none() {
+                // The characters' background (#3518): a fill, or null for
+                // none.
+                let background: Option<Option<Fill>> = match a.get("background") {
+                    None => None,
+                    Some(Value::Null) => Some(None),
+                    Some(v) => match serde_json::from_value::<Fill>(v.clone()) {
+                        Ok(Fill::None) => Some(None),
+                        Ok(f) => Some(Some(f)),
+                        Err(e) => return Err(e.to_string()),
+                    },
+                };
+                if font.is_none()
+                    && size.is_none()
+                    && bold.is_none()
+                    && italic.is_none()
+                    && background.is_none()
+                {
                     return Err("nothing to change".into());
                 }
                 let spans: Vec<TextSpan> = spans
@@ -1680,6 +1734,9 @@ impl HostInner {
                         }
                         if let Some(i) = italic {
                             sp.italic = i;
+                        }
+                        if let Some(b) = &background {
+                            sp.background = b.clone();
                         }
                         sp
                     })
@@ -1797,19 +1854,17 @@ impl HostInner {
                     else {
                         continue;
                     };
-                    let spans: Vec<TextSpan> = spans
-                        .into_iter()
-                        .map(|sp| TextSpan {
-                            text: crate::export::replace_in(
-                                &sp.text,
-                                needle,
-                                &replacement,
-                                match_case,
-                                whole_word,
-                            ),
-                            ..sp
-                        })
-                        .collect();
+                    // The runs as one text, as the interface's Find and
+                    // Replace searches them.
+                    let Some(spans) = crate::export::replace_in_spans(
+                        &spans,
+                        needle,
+                        &replacement,
+                        match_case,
+                        whole_word,
+                    ) else {
+                        continue;
+                    };
                     self.run(Command::SetShapeKind {
                         shape: s.id,
                         kind: ShapeKind::Text {
@@ -2495,6 +2550,7 @@ impl HostInner {
                         sharpness: num(a, "sharpness", 0.0),
                         complex: None,
                         twist: 0.0,
+                        bend: 0.0,
                     },
                 );
                 self.add(layer, s)?
@@ -2668,10 +2724,47 @@ fn dimension_script(d: &crate::dimensions::Dimension) -> String {
     }
 }
 
+/// The `set_text_style` call giving text `id` the style of `spans`, when
+/// they all share it.
+fn text_style_script(id: u64, spans: &[TextSpan]) -> Option<String> {
+    let first = spans.first()?;
+    let same = spans.iter().all(|sp| {
+        sp.font_family == first.font_family
+            && sp.size_pt == first.size_pt
+            && sp.bold == first.bold
+            && sp.italic == first.italic
+            && sp.background == first.background
+    });
+    if !same {
+        return None;
+    }
+    let style = json!({
+        "id": id,
+        "font": first.font_family,
+        "size": first.size_pt,
+        "bold": first.bold,
+        "italic": first.italic,
+        "background": first.background,
+    });
+    Some(format!("__call('set_text_style', {style});\n"))
+}
+
 /// Turn recorded commands into a script the user can edit and replay.
+#[cfg(test)]
 pub fn commands_to_script(cmds: &[Command]) -> String {
+    commands_and_views_to_script(cmds, &[])
+}
+
+/// Turn recorded commands and the lines recorded among them for other
+/// steps (each after the number of commands before it: Zoom To Fit #4020,
+/// a dimension style #4026) into a script.
+pub fn commands_and_views_to_script(cmds: &[Command], views: &[(usize, String)]) -> String {
     let mut out = String::from("// Recorded macro\nconst doc = Application.ActiveDocument;\nconst layer = doc.ActiveLayer;\n");
-    for c in cmds {
+    let mut views = views.iter().peekable();
+    for (i, c) in cmds.iter().enumerate() {
+        while let Some((_, line)) = views.next_if(|(at, _)| *at <= i) {
+            out.push_str(line);
+        }
         match c {
             Command::AddShape { shape, .. } => {
                 // A dimension records as one, kept live (#2348).
@@ -2770,8 +2863,21 @@ pub fn commands_to_script(cmds: &[Command]) -> String {
                     out.push_str(&format!("new Shape({}).Delete();\n", s.raw()));
                 }
             }
+            // A text's character style, set in the Text panel (#3518):
+            // its font, size, weight, slant and background, when every
+            // character shares them.
+            Command::SetShapeKind {
+                shape,
+                kind: ShapeKind::Text { spans, .. },
+            } => match text_style_script(shape.raw(), spans) {
+                Some(line) => out.push_str(&line),
+                None => out.push_str(&format!("// {}\n", c.label())),
+            },
             other => out.push_str(&format!("// {}\n", other.label())),
         }
+    }
+    for (_, line) in views {
+        out.push_str(line);
     }
     out
 }

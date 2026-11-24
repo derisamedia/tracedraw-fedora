@@ -26,13 +26,16 @@ whatever tool is active.
 
 With the Rectangle, Ellipse, Polygon, Star (and Complex star), Graph
 paper, Action Lines, 3-point rectangle, 3-point ellipse, Spiral and
-Common shapes tools still chosen, the pointer over one of those handles
+Common shapes tools (and the Text tool) still chosen, the pointer over one of those handles
 shows the resize arrows and a drag from it resizes the selection as the
 Pick tool's handles do (Shift from the centre, Ctrl in steps, Alt
 freely, a right click for a copy), the tool staying chosen. A click on
 a handle leaves the selection as it is; a press anywhere else draws a
 new object as before
-(`pick_drag_tests::a_drawing_tool_resizes_by_the_handles`).
+(`pick_drag_tests::a_drawing_tool_resizes_by_the_handles`). The Text
+tool does the same with the handles of a text just typed (or a frame
+just drawn), the text staying open for typing (#3258,
+`pick_drag_tests::a_text_just_typed_resizes_by_its_handles_with_the_text_tool`).
 
 ## Drag modifiers (every box tool)
 
@@ -197,6 +200,14 @@ new object as before
 
 - Rows x columns: default 4 x 3. The result is a group of rows x columns
   rectangles that fill the box exactly.
+- Radial (Cells or Radial on the bar, also on the tool's options page,
+  kept in the preferences): Rings (5) ellipses about the box's middle,
+  ring `i` of `n` (outermost first) `(n - i) / n` of the box across,
+  then Spokes (8, 0 to 360) open lines from the middle to the outer
+  ring at `90° + 360° k / spokes`; one group, filled and outlined as the
+  cells are (the spokes unfilled), one undo step "Graph Paper". The
+  preview shows the rings and spokes (`tools2::radial_grid_path`,
+  `tools2::tests::graph_paper_draws_a_radial_grid`).
 
 ## Common shapes
 
@@ -234,6 +245,69 @@ rule. Inner details (the bars of a predefined process, the cross of a
 summing junction, a callout's leader) are straight two-point lines that
 are stroked, not filled. Rounded corners (alternate process, the
 terminator's ends, a rounded callout) keep their size in long boxes.
+
+### Adjusting a shape (#4045)
+
+A common shape stays what it is after it is drawn: the object keeps the
+shape, the box it was drawn into and its adjustments
+(`Shape::common_shape`, saved in `.tdraw` files). While it is selected,
+the Common Shapes tool (right after drawing) and the Shape tool show its
+adjustment handles, diamonds filled in the node colour with a white edge,
+instead of the curve's nodes. Dragging a handle draws the shape again
+from its box with the new setting, live while dragging, and the whole
+drag is one undo step ("Edit Shape"). Each handle moves in a straight
+line with the values it sets, so it stays exactly under the pointer
+until a value reaches the end of its range. A handle that sets two
+values (an arrow's, a callout's tail) moves freely in both directions.
+Snapping applies to the dragged handle. Fills and gradients stay in
+place, as for any new outline.
+
+| Shapes | Handle | Sets (default; range) |
+| --- | --- | --- |
+| Parallelogram, data | top left corner | slant of the top edge (0.25, data 0.2; 0 to 0.95 of the width) |
+| Trapezoid, hexagon, preparation | top left corner | how far the ends come in (0.25; 0 to 0.5) |
+| Manual operation | bottom left corner | same (0.2; 0 to 0.5) |
+| Triangle, extract, merge | apex | where the apex stands along its edge (0.5; 0 to 1) |
+| Octagon | top left corner | size of the cut corners (0.293; 0 to 0.5) |
+| Plus | top left of the upper arm | arm thickness (0.3; 0.02 to 0.98) |
+| Crescent | inner curve's middle | width of the inner curve (0.6; 0 to 0.95 of the outer) |
+| Ring, no symbol | inner edge, right | inner radius (0.3 and 0.36; up to 0.48 of the box); the no symbol's bar keeps its width |
+| Cylinder, magnetic disk, direct access storage | front edge of the end | height of the end ellipse (0.12; 0.01 to 0.5) |
+| Cube | back corner of the top face | depth of the top and side faces (0.25; 0.01 to 0.9) |
+| Frame | inner edge, left | border thickness, the same all round (0.15 of the shorter side; up to 0.49) |
+| Smiley face | bottom of the mouth | smile, 1 a smile, 0 straight, -1 a frown |
+| Right, left, up, down, striped arrows | where head meets shaft | head length (0.4; 0 to 1) and shaft thickness (0.4; 0.02 to 1) together |
+| Left and right, up and down arrows | same | head length (0.3; up to 0.5) and shaft thickness |
+| Four-way arrow | right head's base; top shaft's corner | head length and head width; shaft thickness |
+| Chevron, pentagon arrow | the notch; the point's base | depth of the point (0.3) |
+| Notched arrow | as an arrow, plus the notch | head, shaft and notch depth (0.15) |
+| Bent arrow | top of the tail; head's corner | shaft thickness; head length and width |
+| Alternate process | end of the top left corner | corner radius (0.15 of the shorter side; up to 0.5) |
+| Predefined process | left bar | bars' inset (0.1) |
+| Internal storage | where the lines cross | both lines' places |
+| Document, multiple documents | start of the wavy edge | wave height (0.12; 0 to 0.4) |
+| Manual input, off-page connector | left edge's top | height of the slope's low end, of the point's sides |
+| Card | cut corner | size of the cut (0.2) |
+| Punched tape, wave, double wave | start of the bottom edge | wave height |
+| Stored data, display | top left | depth of the curved side, inset of the point |
+| Ribbon | left notch | notch depth (0.15) |
+| Burst | an inner point | depth of the points (0.82 of the outer radius) |
+| Pennant | bottom of the flag | height of the flag (0.5) |
+| Callouts (all six) | tail's tip | where the tail points, anywhere around the box (the rectangle callouts' tail root follows along the bottom edge, the oval callout opens toward the tip, the cloud callout's puffs line up toward it) |
+
+The other shapes (diamond, decision, right triangle, heart, lightning,
+teardrop, process, terminator, connector, summing junction, or, collate,
+sort, delay, folded ribbon, scroll, explosion) have no handles; they show
+neither handles nor nodes while they are common shapes. Resizing,
+moving, turning or skewing the object keeps it a common shape. Any other
+change to its outline (moving a node elsewhere, an envelope or warp
+made part of it, a knife cut, welding) and Convert To Curves leave an
+ordinary curve, which shows its nodes again; so does an object whose
+outline is no longer the one its settings draw, and a shape from a newer
+version this one does not know
+(`common_shapes::tests::every_handle_follows_a_drag`,
+`common_shapes::tests::a_curve_is_live_while_it_is_its_shape`,
+`pick_drag_tests::a_common_shape_is_adjusted_by_its_handles`).
 
 ### My shapes
 
@@ -332,11 +406,17 @@ pointed one; the angle and stray spacing).
   (within 8 pixels) points the tail elsewhere, one undo step. The bar
   shows the selected balloon's style, width and bend, and a change goes
   to the selected balloons (one undo step) and to the next ones.
+- Add Text on the bar (discussion #3522), enabled with a balloon
+  selected: a paragraph text whose frame is the middle of the body (68 %
+  of the body box for Speech and Whisper, 84 % for Caption, 58 % for
+  Thought, 50 % for Shout), centred whatever the bar's alignment for new
+  texts, the caret in it to type.
 
 ## Checks
 
 - `balloons::tests::every_style_makes_one_closed_curve_reaching_the_tip`
 - `balloons::tests::a_balloon_is_drawn_its_tip_dragged_and_its_style_changed`
+- `balloons::tests::add_text_types_inside_the_balloon`
 
 - Given a 3 mm black default outline, while a rectangle or an ellipse is
   dragged out, the outline is painted at its width and the edge line is

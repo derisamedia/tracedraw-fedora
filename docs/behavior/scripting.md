@@ -8,7 +8,10 @@ builds, so a whole run is one undo step, named `Script` in the history.
 Tools > Scripts opens the panel: a code editor with a line margin, the
 output of the last run, **Run**, **Debug** (see `behavior/script-debugger.md`),
 **Record**, **Load...**, **Save...** and **Install as Filter** (see
-`behavior/script-filters.md`). Recorded macros are plain scripts.
+`behavior/script-filters.md`). Recorded macros are plain scripts. A
+text's font, size, weight, slant and character background set in the
+Text panel record as `set_text_style` when all its characters share
+them (#3518).
 
 A **JavaScript / VBA** pair of buttons above the editor picks the language.
 JavaScript is the object model described here. VBA writes the snippet as a
@@ -85,6 +88,15 @@ below names the call it makes.
 | `Application.Version` | the program's version, as text |
 | `Application.Name` | `'TraceDraw'` |
 | `Application.CreateColor` | the `Color` class |
+| `Application.ZoomToFit()` | View > Zoom To Fit: every object in the window |
+| `Application.ZoomToPage()` | View > Zoom To Page |
+| `Application.ZoomToSelection()` | View > Zoom To Selection |
+| `Application.CopyVisibleArea()` | Edit > Copy Visible Area: what the window shows, as a picture on the clipboard |
+
+The view calls take effect when the script ends, after its objects are in
+the drawing, in the order the script made them (#4020). The macro
+recorder records Zoom To Fit, Zoom To Page, Zoom To Selection and Copy
+Visible Area as these calls, in their place among the other steps.
 
 `ActiveDocument`, `ActivePage`, `ActiveLayer` and `ActiveSelection` are also
 global, so a script can start with either form.
@@ -164,6 +176,8 @@ outline.
 | Name | Meaning |
 |---|---|
 | `Name`, `Text` | read and set |
+| `Font`, `FontSize`, `Bold`, `Italic` | a text's style, read and set; `SetTextStyle({font, size, bold, italic, background})` sets several at once (`background` a fill, or `null` for none) |
+| `TextBackground` | the colour behind a text's characters, apart from their fill, or `null`; set to a colour or `null` (#3518) |
 | `Type` | `Rectangle`, `Ellipse`, `Polygon`, `Star`, `ComplexStar`, `Curve`, `Text`, `Group`, `Bitmap`, `ClipFrame`, `Table`, `Symbol` |
 | `PositionX`, `PositionY` | bottom left of the bounding box |
 | `SizeWidth`, `SizeHeight` | the bounding box's size |
@@ -234,7 +248,9 @@ So `AddDropShadow` leaves `Effects.Count` as it was.
 make a live dimension from (x1, y1) to (x2, y2), its line through
 (tx, ty), in the Dimension tool's style, font and units: the same object
 the tool draws, which follows the objects it measures when they are
-edited. `CreateLinearDimension(kind, ...)` takes the kind as `'parallel'`,
+edited: a point within 0.01 mm of a node or an edge of an object on the
+page holds to it, as the tool's points hold within 3 pixels.
+`CreateLinearDimension(kind, ...)` takes the kind as `'parallel'`,
 `'horizontal'`, `'vertical'` or `'auto'` (the larger span).
 `CreateAngularDimension(cx, cy, x1, y1, x2, y2, tx, ty)` measures the
 angle at (cx, cy) from the first point to the second, its arc through
@@ -244,11 +260,26 @@ angle at (cx, cy) from the first point to the second, its arc through
 VBA macros have `Layer.CreateLinearDimension(Type, Point1, Point2,
 TextCentered, TextX, TextY)` with `cdrDimensionHorizontal` (0),
 `cdrDimensionVertical` (1) and `cdrDimensionSlanted` (2), and
-`Layer.CreateAngularDimension(Center, Point1, Point2, TextX, TextY)`. A
+`Layer.CreateAngularDimension(Center, Point1, Point2, TextX, TextY)`,
+and `CreateHorizontalDimension`, `CreateVerticalDimension` and
+`CreateParallelDimension(x1, y1, x2, y2, TextX, TextY)` with the points
+as numbers, as scripts name them (#3517). A
 point is anything with `PositionX`/`PositionY`, `{x, y}` or `[x, y]`, in
 the document unit; without TextX/TextY the line goes 10 mm off the
-points. A recorded macro records a dimension the Dimension tools drew as
-one of these calls, so playing it back makes a live dimension again.
+points. A recorded macro records a dimension the Dimension tools drew
+(and those Add Dimensions draws) as one of these calls, so playing it back
+makes a live dimension again; they went unrecorded until 0.48 (#2348).
+
+A dimension's style is set with `Shape.SetDimensionStyle(style)` (also on
+a `ShapeRange` and `ActiveSelection`), `style` naming the settings as a
+style is saved: `text_size` (points), `font`, `precision`, `prefix`,
+`suffix`, `line_width`, `text_color` and the others; objects that are not
+dimensions are left alone, a name the style does not have is an error,
+and it answers how many dimensions changed. `Shape.LabelSize` reads and
+sets the label's size in points (`null` for other objects). A change made
+on the Dimension bar while a macro is recorded is recorded as
+`ActiveSelection.SetDimensionStyle({...})` with the settings it changed,
+so it plays back on the dimension the macro just drew (#4026).
 
 ### Symbols
 
@@ -294,5 +325,12 @@ what the user sees.
 - `scripting::extra::tests::a_script_makes_live_dimensions`
 - `scripting::extra::tests::a_vba_macro_makes_a_linear_dimension`
 - `scripting::extra::tests::a_recorded_dimension_plays_back_as_one`
+- `scripting::extra::tests::dimensions_drawn_while_recording_are_recorded`
+- `view_steps::tests::the_recorder_keeps_the_zoom_steps`
+- `scripting::extra::tests::a_dimension_label_size_change_is_recorded_and_plays_back`
+- `scripting::extra::tests::scripts_and_macros_set_a_dimensions_label_size`
+- `view_steps::tests::a_recorded_zoom_to_fit_plays_back`
+- `view_steps::tests::scripts_and_macros_zoom_to_fit_the_objects`
+- `scripting::extra::tests::a_script_dimension_follows_its_object`
 - `scripting::extra::tests::similar_groups_become_one_symbol_and_keep_their_text`
 - `scripting::extra::tests::a_script_creates_and_places_symbols`

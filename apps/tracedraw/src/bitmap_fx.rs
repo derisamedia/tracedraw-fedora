@@ -13,6 +13,9 @@ pub enum ColorMode {
     Paletted,
     /// Lab Color (24-bit): marked in the PNG (#2605).
     Lab,
+    /// Black and White (1-bit): a 1-bit grey PNG, or a grey one marked so
+    /// when some pixels are see-through (#2922).
+    BlackWhite,
 }
 
 /// Convert the colour mode (Image > Mode).
@@ -31,7 +34,11 @@ pub fn convert_mode(img: &RgbaImage, mode: ColorMode) -> RgbaImage {
         // RGB and CMYK keep the pixels; the mode is a document attribute.
         // Indexed and Lab keep them here too: their pixels are made by
         // `bitmap_modes::paletted` and `lab_mode`, the mode by the PNG.
-        ColorMode::Rgb | ColorMode::Cmyk | ColorMode::Paletted | ColorMode::Lab => img.clone(),
+        ColorMode::Rgb
+        | ColorMode::Cmyk
+        | ColorMode::Paletted
+        | ColorMode::Lab
+        | ColorMode::BlackWhite => img.clone(),
     }
 }
 
@@ -105,44 +112,108 @@ pub fn decode(png: &[u8]) -> Option<RgbaImage> {
 
 /// Encode an RGBA image as PNG bytes.
 pub fn encode(img: &RgbaImage) -> Option<Vec<u8>> {
-    let mut buf = std::io::Cursor::new(Vec::new());
-    img.write_to(&mut buf, image::ImageFormat::Png).ok()?;
-    Some(buf.into_inner())
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+    use image::ImageEncoder;
+    let mut buf = Vec::new();
+    PngEncoder::new_with_quality(&mut buf, CompressionType::Fast, FilterType::Sub)
+        .write_image(
+            img.as_raw(),
+            img.width(),
+            img.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .ok()?;
+    Some(buf)
+}
+
+/// `img` laid on white paper: every pixel opaque, a see-through one
+/// mixed with white by its opacity.
+pub fn flatten_on_white(img: &RgbaImage) -> RgbaImage {
+    let mut out = img.clone();
+    for p in out.pixels_mut() {
+        let a = u16::from(p[3]);
+        for c in 0..3 {
+            p[c] = ((u16::from(p[c]) * a + 255 * (255 - a) + 127) / 255) as u8;
+        }
+        p[3] = 255;
+    }
+    out
 }
 
 /// Encode `img` as a grayscale PNG (8-bit gray, with an alpha channel
 /// only when a pixel is not opaque): a grayscale picture, whose colour
 /// mode the status line reads from the PNG (#1777). Each pixel's level
-/// is its luminance, `0.299 R + 0.587 G + 0.114 B`.
+/// is its luminance, `0.299 R + 0.587 G + 0.114 B`, computed in one
+/// integer pass over the raw RGBA bytes.
 pub fn encode_gray(img: &RgbaImage) -> Option<Vec<u8>> {
-    let level = |p: &Rgba<u8>| {
-        (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-    let mut buf = std::io::Cursor::new(Vec::new());
-    if img.pixels().all(|p| p[3] == 255) {
-        let gray = image::GrayImage::from_fn(img.width(), img.height(), |x, y| {
-            image::Luma([level(img.get_pixel(x, y))])
-        });
-        gray.write_to(&mut buf, image::ImageFormat::Png).ok()?;
-    } else {
-        let gray = image::GrayAlphaImage::from_fn(img.width(), img.height(), |x, y| {
-            let p = img.get_pixel(x, y);
-            image::LumaA([level(p), p[3]])
-        });
-        gray.write_to(&mut buf, image::ImageFormat::Png).ok()?;
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+    use image::ImageEncoder;
+    let (w, h) = img.dimensions();
+    let n = (w as usize).checked_mul(h as usize)?;
+    let raw = img.as_raw();
+    if raw.len() < n.checked_mul(4)? {
+        return None;
     }
-    Some(buf.into_inner())
+    let luma = |p: &[u8]| -> u8 {
+        ((299 * u32::from(p[0]) + 587 * u32::from(p[1]) + 114 * u32::from(p[2]) + 500) / 1000) as u8
+    };
+    let mut chunks = raw[..n * 4].chunks_exact(4);
+    let mut gray = Vec::with_capacity(n);
+    let mut ga: Option<Vec<u8>> = None;
+    while let Some(p) = chunks.next() {
+        let y = luma(p);
+        if p[3] == 255 {
+            gray.push(y);
+        } else {
+            let mut out = Vec::with_capacity(n.checked_mul(2)?);
+            for &g in &gray {
+                out.extend_from_slice(&[g, 255]);
+            }
+            gray = Vec::new();
+            out.extend_from_slice(&[y, p[3]]);
+            for rest in chunks {
+                out.extend_from_slice(&[luma(rest), rest[3]]);
+            }
+            ga = Some(out);
+            break;
+        }
+    }
+    let mut buf = Vec::new();
+    let enc = PngEncoder::new_with_quality(&mut buf, CompressionType::Fast, FilterType::Sub);
+    match ga {
+        None => enc
+            .write_image(&gray, w, h, image::ExtendedColorType::L8)
+            .ok()?,
+        Some(ga) => enc
+            .write_image(&ga, w, h, image::ExtendedColorType::La8)
+            .ok()?,
+    }
+    Some(buf)
 }
 
-/// The colour mode a bitmap is in: CMYK when marked so, grayscale when
-/// its PNG holds one grey channel, indexed when it holds a palette, Lab
+/// The language key of a bitmap's colour mode name, as the status bar
+/// and the Objects docker show it.
+pub fn mode_key(cmyk: bool, png: &[u8]) -> &'static str {
+    match mode_of(cmyk, png) {
+        ColorMode::Cmyk => "convert_colors.cmyk",
+        ColorMode::Grayscale => "convert_colors.gray",
+        ColorMode::Paletted => "dialog.convert_mode_paletted",
+        ColorMode::Lab => "convert_colors.lab",
+        ColorMode::BlackWhite => "dialog.convert_mode_bw",
+        ColorMode::Rgb => "convert_colors.rgb",
+    }
+}
+
+/// The colour mode a bitmap is in: CMYK when marked so, black and white
+/// when its PNG is 1-bit (or marked so), grayscale when its PNG holds
+/// one grey channel, indexed when it holds a palette, Lab
 /// when the PNG is marked Lab, else RGB (the status bar and the Mode
 /// menu, #1254, #2330, #2605, #2607).
 pub fn mode_of(cmyk: bool, png: &[u8]) -> ColorMode {
     if cmyk {
         ColorMode::Cmyk
+    } else if png_is_black_white(png) {
+        ColorMode::BlackWhite
     } else if png_is_gray(png) {
         ColorMode::Grayscale
     } else if png_is_paletted(png) {
@@ -181,16 +252,76 @@ fn png_chunks(png: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
 /// Color, #2605): a `tEXt` chunk naming the mode, which the pixels (RGB
 /// for the screen, as a CMYK bitmap's are) cannot tell.
 pub fn png_is_lab(png: &[u8]) -> bool {
-    png.get(..8) == Some(b"\x89PNG\r\n\x1a\n".as_slice())
-        && png_chunks(png)
-            .take_while(|(ty, _)| *ty != b"IDAT")
-            .any(|(ty, data)| {
-                ty == b"tEXt"
-                    && data
-                        .strip_prefix(LAB_KEY)
-                        .and_then(|d| d.strip_prefix(b"\0"))
-                        == Some(b"Lab")
-            })
+    png_mode_mark(png) == Some(b"Lab".as_slice())
+}
+
+/// The colour mode a PNG is marked with in its `tEXt` chunk, if any.
+fn png_mode_mark(png: &[u8]) -> Option<&[u8]> {
+    if png.get(..8) != Some(b"\x89PNG\r\n\x1a\n".as_slice()) {
+        return None;
+    }
+    png_chunks(png)
+        .take_while(|(ty, _)| *ty != b"IDAT")
+        .find_map(|(ty, data)| {
+            (ty == b"tEXt")
+                .then(|| data.strip_prefix(LAB_KEY)?.strip_prefix(b"\0"))
+                .flatten()
+        })
+}
+
+/// Whether `png` is a Black and White (1-bit) bitmap: a grey PNG of one
+/// bit per pixel, or a grey one marked so (see-through pixels need an
+/// alpha channel, which 1-bit PNGs lack) (#2922).
+pub fn png_is_black_white(png: &[u8]) -> bool {
+    let one_bit = png.get(..8) == Some(b"\x89PNG\r\n\x1a\n".as_slice())
+        && png.get(12..16) == Some(b"IHDR".as_slice())
+        && png.get(24) == Some(&1)
+        && png.get(25) == Some(&0);
+    one_bit || png_mode_mark(png) == Some(b"BlackWhite".as_slice())
+}
+
+/// Encode a black and white picture (every pixel black or white) as a
+/// Black and White (1-bit) bitmap: a 1-bit grey PNG when it is opaque, a
+/// grey PNG with alpha marked Black and White when some pixels are
+/// see-through. Images > Mode > Black and White left the picture RGB
+/// (#2922).
+pub fn encode_bw(img: &RgbaImage) -> Option<Vec<u8>> {
+    use std::io::Write;
+    let white =
+        |p: &Rgba<u8>| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32 >= 127.5;
+    if !img.pixels().all(|p| p[3] == 255) {
+        let bw = ImageBuffer::from_fn(img.width(), img.height(), |x, y| {
+            let p = img.get_pixel(x, y);
+            let v = if white(p) { 255 } else { 0 };
+            Rgba([v, v, v, p[3]])
+        });
+        return with_mode_mark(&encode_gray(&bw)?, b"BlackWhite");
+    }
+    let (w, h) = img.dimensions();
+    let row = (w as usize).div_ceil(8);
+    let mut raw = Vec::with_capacity((row + 1) * h as usize);
+    for y in 0..h {
+        raw.push(0); // filter: none
+        let start = raw.len();
+        raw.resize(start + row, 0);
+        for x in 0..w {
+            if white(img.get_pixel(x, y)) {
+                raw[start + x as usize / 8] |= 0x80 >> (x % 8);
+            }
+        }
+    }
+    let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    z.write_all(&raw).ok()?;
+    let idat = z.finish().ok()?;
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&w.to_be_bytes());
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[1, 0, 0, 0, 0]);
+    put_chunk(&mut out, b"IHDR", &ihdr);
+    put_chunk(&mut out, b"IDAT", &idat);
+    put_chunk(&mut out, b"IEND", &[]);
+    Some(out)
 }
 
 /// One PNG chunk: length, type, data and the CRC of type and data.
@@ -259,14 +390,49 @@ pub fn encode_indexed(img: &RgbaImage) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Encode `img`, a picture in the Indexed (8-bit) mode, as an indexed
+/// PNG in any case (#3504, #3539). Its palette colours with the many
+/// see-through levels of soft edges made more than 256 entries, and the
+/// picture was stored as RGB: the see-through levels are then made clear
+/// or opaque (at half), as a palette picture keeps one clear entry, and
+/// when more than 255 colours are still left beside it they are taken
+/// to a palette of 255. `None` only when the picture cannot be encoded.
+pub fn encode_indexed_fitted(img: &RgbaImage) -> Option<Vec<u8>> {
+    if let Some(png) = encode_indexed(img) {
+        return Some(png);
+    }
+    let mut snapped = img.clone();
+    for p in snapped.pixels_mut() {
+        *p = if p[3] < 128 {
+            Rgba([0, 0, 0, 0])
+        } else {
+            Rgba([p[0], p[1], p[2], 255])
+        };
+    }
+    if let Some(png) = encode_indexed(&snapped) {
+        return Some(png);
+    }
+    let settings = crate::bitmap_modes::PalettedSettings {
+        colors: 255,
+        dither: crate::bitmap_modes::Dither::None,
+        ..Default::default()
+    };
+    let fewer = crate::bitmap_modes::paletted(&snapped, &settings);
+    encode_indexed(&fewer).or_else(|| encode(&fewer))
+}
+
 /// Encode `img` as a PNG marked Lab Color (see [`png_is_lab`]).
 pub fn encode_lab(img: &RgbaImage) -> Option<Vec<u8>> {
-    let png = encode(img)?;
+    with_mode_mark(&encode(img)?, b"Lab")
+}
+
+/// `png` with a `tEXt` chunk marking its colour mode `mode`.
+fn with_mode_mark(png: &[u8], mode: &[u8]) -> Option<Vec<u8>> {
     // After the signature and the IHDR chunk (8 + 25 bytes).
     let at = 8 + 12 + u32::from_be_bytes(png.get(8..12)?.try_into().ok()?) as usize;
     let mut text = LAB_KEY.to_vec();
     text.push(0);
-    text.extend_from_slice(b"Lab");
+    text.extend_from_slice(mode);
     let mut chunk = Vec::new();
     put_chunk(&mut chunk, b"tEXt", &text);
     let mut out = png.get(..at)?.to_vec();
@@ -552,5 +718,61 @@ mod tests {
         assert_eq!(mode_of(false, &lab), ColorMode::Lab);
         assert_eq!(decode(&lab).expect("reads"), img);
         assert!(!png_is_lab(&encode(&img).expect("png")));
+    }
+
+    #[test]
+    fn black_and_white_bitmaps_are_one_bit_pngs() {
+        // #2922: opaque, a 1-bit grey PNG; with see-through pixels, a grey
+        // PNG marked Black and White. Either reads back as it was.
+        let img = RgbaImage::from_fn(13, 5, |x, y| {
+            let v = if (x + y) % 3 == 0 { 0 } else { 255 };
+            Rgba([v, v, v, 255])
+        });
+        let png = encode_bw(&img).expect("encodes");
+        assert_eq!(png[24], 1, "one bit per pixel");
+        assert_eq!(png[25], 0, "grey");
+        assert_eq!(mode_of(false, &png), ColorMode::BlackWhite);
+        assert_eq!(decode(&png).expect("decodes"), img);
+        let mut clear = img.clone();
+        clear.get_pixel_mut(0, 0)[3] = 0;
+        let png = encode_bw(&clear).expect("encodes");
+        assert_eq!(mode_of(false, &png), ColorMode::BlackWhite);
+        assert!(!png_is_lab(&png));
+        let back = decode(&png).expect("decodes");
+        assert_eq!(back.get_pixel(0, 0)[3], 0);
+        assert_eq!(back.get_pixel(1, 0), img.get_pixel(1, 0));
+        // A grey picture is not black and white, nor is a Lab one.
+        assert_eq!(
+            mode_of(false, &encode_gray(&img).expect("gray")),
+            ColorMode::Grayscale
+        );
+        assert_eq!(
+            mode_of(false, &encode_lab(&img).expect("lab")),
+            ColorMode::Lab
+        );
+    }
+
+    #[test]
+    fn encode_gray_one_pass_preserves_luma_and_alpha() {
+        let mut opaque = RgbaImage::new(3, 1);
+        opaque.put_pixel(0, 0, Rgba([0, 0, 0, 255]));
+        opaque.put_pixel(1, 0, Rgba([255, 255, 255, 255]));
+        opaque.put_pixel(2, 0, Rgba([100, 150, 200, 255]));
+        let png = encode_gray(&opaque).expect("opaque gray");
+        assert_eq!(png[25], 0, "8-bit L8 without alpha");
+        let back = decode(&png).expect("decodes");
+        let want = ((299 * 100u32 + 587 * 150 + 114 * 200 + 500) / 1000) as u8;
+        assert_eq!(back.get_pixel(0, 0), &Rgba([0, 0, 0, 255]));
+        assert_eq!(back.get_pixel(1, 0), &Rgba([255, 255, 255, 255]));
+        assert_eq!(back.get_pixel(2, 0), &Rgba([want, want, want, 255]));
+
+        let mut semi = opaque.clone();
+        semi.put_pixel(2, 0, Rgba([100, 150, 200, 128]));
+        let png_a = encode_gray(&semi).expect("gray with alpha");
+        assert_eq!(png_a[25], 4, "8-bit La8 with alpha");
+        let back_a = decode(&png_a).expect("decodes");
+        assert_eq!(back_a.get_pixel(0, 0), &Rgba([0, 0, 0, 255]));
+        assert_eq!(back_a.get_pixel(1, 0), &Rgba([255, 255, 255, 255]));
+        assert_eq!(back_a.get_pixel(2, 0), &Rgba([want, want, want, 128]));
     }
 }

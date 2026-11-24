@@ -182,7 +182,7 @@ opening such a file names the palette from it.
 
 ## Default palette
 
-The default CMYK palette, 94 named colours, is made by a rule
+The default CMYK palette, 95 named colours, is made by a rule
 (`palette::default_cmyk`), every ink a whole percentage:
 
 1. The basics (22), first in the strip: Black, 90% Black to 10% Black,
@@ -194,6 +194,10 @@ The default CMYK palette, 94 named colours, is made by a rule
    to the violets and purples and the deep blues. Every one has a plain
    descriptive name ("Dusty Blue", "Slate Blue", "Pale Slate", "Olive
    Green", "Dark Red", "Lilac"), none of them repeated.
+3. Last, Registration Black: C100 M100 Y100 K100, the black that prints
+   on every CMYK plate, for registration and other marks. Built-in
+   palettes cannot be edited, so it had to be mixed by hand every time
+   (#3666, `palette::tests::the_default_palette_follows_its_rule`).
 
 The list is the classic palette with five swatches taken out of its first
 50: after the basics, one swatch in every fourth or fifth (4 kept, 1
@@ -210,14 +214,17 @@ mode, Document Info) the default palette shows and applies its
 colours as clean RGB values (names kept; spot inks and registration stay
 as they are). The default palette's colours come from the RGB default
 palette, a table of RGB values defined directly
-(`palette::default_rgb`, the same 94 names in the same order, also the
+(`palette::default_rgb`, the same names in the same order up to Deep
+Blue, 94 of them, also the
 Palette Manager's built-in Default RGB palette), found by name and colour
 so a default palette edited in the Palette Editor keeps them, and worked
 out when the palette changes rather than every frame: 10%
 greys (90% Black 26 26 26, 50% Black 128 128 128) and multiples of 17
 otherwise, the plain ink formula below rounded to the nearest multiple
 (Black 0 0 0, Red 255 0 0, Orange 255 102 0, Sky Blue 0 204 255, Dark Green
-0 51 51, Dusty Blue 102 102 204; no two swatches share a value, Deep Blue is 0 0 68). Any other CMYK colour
+0 51 51, Dusty Blue 102 102 204; no two swatches share a value, Deep Blue is 0 0 68).
+Registration Black has no twin there and shows as the plain black of its
+inks, 0 0 0. Any other CMYK colour
 takes the plain RGB of its inks, R = 255 (1 - min(1, C + K)) and so on,
 not the press simulation; other colours are converted as the colour
 management converts. A CMYK drawing keeps them CMYK (#483, #620,
@@ -383,6 +390,16 @@ spot colour adds its ink to the drawing, named as typed. A spot colour,
 an ink of the drawing, keeps its value; Save as writes the colours to a
 palette file without changing the drawing. Until 2026-11-14 the name and
 Spot colour were greyed in the document palette.
+A colour made a spot colour, in the document palette or in a palette of
+the user's, as it is (its value not changed too), also goes to the
+objects of the open drawing painted with it: their fills, outlines and
+the other colours they hold in that colour take the spot colour, and its
+ink joins the drawing, as one undo step (the document palette's own
+step). So separations, PDF, EPS and PostScript output and a printer's RIP
+see the ink; the objects were left in process inks, and a UV printer
+printed its white as black (#2580,
+`ui::palette_editor::tests::a_colour_made_spot_paints_the_objects_that_use_it`,
+`a_document_colour_made_spot_paints_the_objects_that_use_it`).
 Spot colours have a small dot in the corner of their swatch, in the
 editor and on the palette bars, black on a light ink and white on a dark
 one. The fill and outline swatches of the status bar and the Colour panel carry

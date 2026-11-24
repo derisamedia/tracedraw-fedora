@@ -1,20 +1,19 @@
 //! File access for both builds.
 //!
 //! Natively these are the file system and the system file dialogs, used
-//! synchronously as before. In a browser there is no file system: a file
+//! asynchronously on desktop. In a browser there is no file system: a file
 //! the user picks is kept in memory under a synthetic path
 //! (`/upload/<name>`), so the path-based open and import code reads it with
 //! [`read`] like any file, and [`write`] offers the bytes as a download
 //! named after the path's file name.
 //!
 //! Dialogs come in three shapes:
-//! - [`Dialog::pick_file`] runs a closure with the picked path: at once
-//!   natively, on a later frame in a browser (see [`run_finished`]).
+//! - [`Dialog::pick_file`] runs a closure with the picked path:
+//!   on a later frame on desktop and in a browser (see [`run_finished`]).
 //! - [`Dialog::pick_into`] stores the picked path under a key that a
-//!   dialog's own code collects with [`take_picked`] on the same frame
-//!   (natively) or a later one (browser).
-//! - [`Dialog::save_file`] runs a closure with the chosen path at once: a
-//!   save dialog natively, `/download/<file name>` in a browser.
+//!   dialog's own code collects with [`take_picked`] on a later frame.
+//! - [`Dialog::save_file`] runs a closure with the chosen path on a later
+//!   native frame, or at once with `/download/<file name>` in a browser.
 
 use crate::app::App;
 use std::cell::RefCell;
@@ -30,6 +29,86 @@ thread_local! {
     static PICKED: RefCell<HashMap<String, PathBuf>> = RefCell::new(HashMap::new());
     /// Uploaded files by synthetic path (browser only).
     static STORE: RefCell<HashMap<PathBuf, Vec<u8>>> = RefCell::new(HashMap::new());
+    /// Uploads whose job ran but that the app still reads on a later
+    /// frame (an import waiting for its place, a PDF question), freed
+    /// once nothing does (#3231).
+    static LINGERING: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+type NativeJob = Box<dyn FnOnce(&mut App, Vec<PathBuf>) + 'static>;
+
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+struct NativeDialogs {
+    next_id: u64,
+    pending: HashMap<u64, NativeJob>,
+    sender: std::sync::mpsc::Sender<(u64, Vec<PathBuf>)>,
+    receiver: std::sync::mpsc::Receiver<(u64, Vec<PathBuf>)>,
+    context: Option<egui::Context>,
+}
+
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+impl NativeDialogs {
+    fn new() -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        Self {
+            next_id: 0,
+            pending: HashMap::new(),
+            sender,
+            receiver,
+            context: None,
+        }
+    }
+
+    fn register(&mut self, job: NativeJob) -> Option<u64> {
+        let Some(next_id) = self.next_id.checked_add(1) else {
+            log::error!("native dialog request IDs exhausted");
+            return None;
+        };
+        let id = self.next_id;
+        self.next_id = next_id;
+        self.pending.insert(id, job);
+        Some(id)
+    }
+}
+
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+thread_local! {
+    // Callbacks stay on the UI thread; only IDs and owned paths cross threads.
+    static NATIVE_DIALOGS: RefCell<NativeDialogs> = RefCell::new(NativeDialogs::new());
+}
+
+/// Resolve a native picker on a worker and defer its callback to the UI frame.
+/// An empty result cancels the job without invoking its callback.
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+fn schedule_native_dialog(
+    future: impl std::future::Future<Output = Vec<PathBuf>> + Send + 'static,
+    job: impl FnOnce(&mut App, Vec<PathBuf>) + 'static,
+) {
+    let registration = NATIVE_DIALOGS.with(|state| {
+        let mut state = state.borrow_mut();
+        let id = state.register(Box::new(job))?;
+        Some((id, state.sender.clone(), state.context.clone()))
+    });
+    let Some((id, sender, context)) = registration else {
+        return;
+    };
+    if let Err(error) = std::thread::Builder::new()
+        .name("native-file-dialog".into())
+        .spawn(move || {
+            let paths = pollster::block_on(future);
+            if sender.send((id, paths)).is_ok() {
+                if let Some(context) = context {
+                    context.request_repaint();
+                }
+            }
+        })
+    {
+        NATIVE_DIALOGS.with(|state| {
+            state.borrow_mut().pending.remove(&id);
+        });
+        log::error!("cannot start native file dialog worker: {error}");
+    }
 }
 
 /// True in the browser build: no file system, downloads instead of saves.
@@ -128,6 +207,7 @@ pub fn name_with_extension(name: &str, mime: &str) -> String {
         "image/gif" => "gif",
         "image/bmp" => "bmp",
         "image/webp" => "webp",
+        "image/jxl" => "jxl",
         "image/tiff" => "tiff",
         "image/svg+xml" => "svg",
         "text/plain" => "txt",
@@ -221,6 +301,7 @@ pub fn mime_for_extension(ext: &str) -> &'static str {
         "gif" => "image/gif",
         "bmp" => "image/bmp",
         "webp" => "image/webp",
+        "jxl" => "image/jxl",
         "tif" | "tiff" => "image/tiff",
         "svg" => "image/svg+xml",
         "txt" => "text/plain",
@@ -351,7 +432,7 @@ pub fn write(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result
     if let Some(uri) = document_uri(path) {
         return crate::android::documents::write(&uri, bytes.as_ref());
     }
-    std::fs::write(path, bytes)
+    replace_with(path, |w| std::io::Write::write_all(w, bytes.as_ref()))
 }
 
 /// Write a file as `fill` makes it, without holding the whole file in
@@ -368,9 +449,83 @@ pub fn write_with(
         fill(&mut bytes)?;
         return write(path, bytes);
     }
-    let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
-    fill(&mut w)?;
-    std::io::Write::flush(&mut w)
+    replace_with(path, fill)
+}
+
+/// Write the file `path` as `fill` makes it, never losing the file that
+/// was there when the write fails half way (a full disk, an error while
+/// the drawing is written, the program stopped): the new file is made
+/// whole under a `.part` name beside it first, and only then takes the
+/// old one's place. A file that was there is written over in place from
+/// the `.part` file, so it keeps its permissions and links and an open
+/// drawing's hold on it (`file_hold`) stays; should that copy fail, the
+/// `.part` file stays with the whole new file and the error names it. A
+/// new file is the `.part` file renamed. Where no `.part` file can be
+/// made (a folder that takes no new files, a device), the file is
+/// written directly, as before.
+fn replace_with(
+    path: &Path,
+    fill: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let direct = |fill: &mut dyn FnMut(&mut dyn std::io::Write) -> std::io::Result<()>| {
+        let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
+        fill(&mut w)?;
+        w.flush()
+    };
+    let mut fill = Some(fill);
+    let mut once = |w: &mut dyn std::io::Write| match fill.take() {
+        Some(f) => f(w),
+        None => Ok(()),
+    };
+    let existing = std::fs::metadata(path).ok();
+    if existing.as_ref().is_some_and(|m| !m.is_file()) {
+        return direct(&mut once);
+    }
+    let mut part = path.as_os_str().to_owned();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    let Ok(file) = std::fs::File::create(&part) else {
+        return direct(&mut once);
+    };
+    let written = (|| {
+        let mut w = std::io::BufWriter::new(file);
+        once(&mut w)?;
+        w.flush()?;
+        w.get_ref().sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
+    if existing.is_none() {
+        return match std::fs::rename(&part, path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&part);
+                Err(e)
+            }
+        };
+    }
+    let copied = std::fs::File::open(&part).and_then(|mut from| {
+        let mut to = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+        std::io::copy(&mut from, &mut to)?;
+        to.flush()?;
+        to.sync_all()
+    });
+    match copied {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&part);
+            Ok(())
+        }
+        Err(e) => Err(std::io::Error::new(
+            e.kind(),
+            format!("{e}; the whole file is in {}", part.display()),
+        )),
+    }
 }
 
 /// Write a file as `fill` makes it, creating its folder first
@@ -536,11 +691,16 @@ pub enum FolderUse {
     BackupFolder,
     /// Options > Save, the auto-backups.
     AutoBackupFolder,
+    /// The Save Drawing dialog's Browse, the system's folder window
+    /// with the places only it knows (#3416).
+    SaveDrawing,
+    /// The bitmap pattern picker's folder of pictures (#3323).
+    PatternFolder,
 }
 
 impl FolderUse {
     #[cfg(test)]
-    pub const ALL: [FolderUse; 8] = [
+    pub const ALL: [FolderUse; 10] = [
         FolderUse::ExportAssets,
         FolderUse::Package,
         FolderUse::FontFolder,
@@ -549,6 +709,8 @@ impl FolderUse {
         FolderUse::DictionaryFolder,
         FolderUse::BackupFolder,
         FolderUse::AutoBackupFolder,
+        FolderUse::SaveDrawing,
+        FolderUse::PatternFolder,
     ];
 
     /// What the folder button does in this build.
@@ -566,7 +728,7 @@ impl FolderUse {
 /// What a folder button does (#1399).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FolderAction {
-    /// The system's folder dialog ([`pick_folder`]), on the desktop.
+    /// The system's folder dialog ([`pick_folder_into`]), on the desktop.
     PickFolder(FolderToken),
     /// The files are written into one zip file, downloaded in a browser
     /// and saved where the system's save picker says on Android.
@@ -603,6 +765,9 @@ pub fn folder_action(place: FolderUse, platform: Platform) -> FolderAction {
         (Platform::Android, BackupFolder | AutoBackupFolder) => {
             Unavailable("folder.backup_android")
         }
+        (_, SaveDrawing) => Unavailable("folder.save_desktop"),
+        // Import picture... reads one file there (#3323).
+        (_, PatternFolder) => Unavailable("folder.pattern_desktop"),
     }
 }
 
@@ -622,17 +787,68 @@ pub fn folder_tip(place: FolderUse, platform: Platform) -> Option<&'static str> 
     }
 }
 
-/// Choose a folder with the system's dialog (`None` when cancelled). The
-/// token comes from [`folder_action`], which gives one on the desktop only.
-pub fn pick_folder(token: FolderToken) -> Option<PathBuf> {
-    let _ = token;
+/// Choose a folder with the system's dialog. The token comes from
+/// [`folder_action`], which gives one on the desktop only; a picked folder is
+/// kept under `key` for the next UI frame, and Cancel leaves it untouched.
+pub fn pick_folder_into(token: FolderToken, start: Option<&Path>, key: &str) {
+    let key = key.to_string();
     #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
-    {
-        rfd::FileDialog::new().pick_folder()
-    }
+    schedule_native_dialog(native_folder_pick(token, start), move |_, paths| {
+        if let Some(path) = paths.into_iter().next() {
+            PICKED.with(|p| p.borrow_mut().insert(key, path));
+        }
+    });
     #[cfg(any(target_arch = "wasm32", target_os = "android"))]
+    let _ = (token, start, key);
+}
+
+/// Choose a folder and resume an action on the UI thread after a selection.
+pub fn pick_folder_with(
+    token: FolderToken,
+    start: Option<&Path>,
+    then: impl FnOnce(&mut App, PathBuf) + 'static,
+) {
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    schedule_native_dialog(native_folder_pick(token, start), move |app, paths| {
+        if let Some(path) = paths.into_iter().next() {
+            then(app, path);
+        }
+    });
+    #[cfg(any(target_arch = "wasm32", target_os = "android"))]
+    let _ = (token, start, then);
+}
+
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+fn native_folder_dialog(token: FolderToken, start: Option<&Path>) -> rfd::AsyncFileDialog {
+    let _ = token;
+    let mut dialog = rfd::AsyncFileDialog::new();
+    if let Some(start) = start.filter(|s| s.is_dir()) {
+        dialog = dialog.set_directory(start);
+    }
+    dialog
+}
+
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+fn native_folder_pick(
+    token: FolderToken,
+    start: Option<&Path>,
+) -> impl std::future::Future<Output = Vec<PathBuf>> + Send + 'static {
+    #[cfg(test)]
     {
-        None
+        let _ = native_folder_dialog(token, start);
+        std::future::ready(test_pick::ask().into_iter().take(1).collect())
+    }
+    #[cfg(not(test))]
+    {
+        let dialog = native_folder_dialog(token, start);
+        async move {
+            dialog
+                .pick_folder()
+                .await
+                .into_iter()
+                .map(|handle| handle.path().to_path_buf())
+                .collect()
+        }
     }
 }
 
@@ -878,6 +1094,10 @@ pub enum Place {
     /// A mounted drive, memory card, network share or other volume
     /// (#1391): named after its folder.
     Drive,
+    /// A cloud storage folder (OneDrive, Dropbox, Google Drive, iCloud
+    /// Drive), named after its folder: the system's own file windows
+    /// list them, the Save Drawing dialog did not (#3416).
+    Cloud,
 }
 
 /// The user's home folder.
@@ -917,6 +1137,11 @@ pub fn places() -> Vec<(Place, PathBuf)> {
             out.push((place, dir));
         }
     }
+    for dir in cloud_dirs(&home, &|k| std::env::var_os(k)) {
+        if dir.is_dir() && !out.iter().any(|(_, p)| *p == dir) {
+            out.push((Place::Cloud, dir));
+        }
+    }
     if cfg!(windows) {
         for letter in b'C'..=b'Z' {
             let root = PathBuf::from(format!("{}:\\", letter as char));
@@ -932,6 +1157,31 @@ pub fn places() -> Vec<(Place, PathBuf)> {
             out.push((Place::Drive, drive));
         }
     }
+    out
+}
+
+/// The cloud storage folders the desktop programs of OneDrive, Dropbox,
+/// Google Drive and iCloud make in the home folder `home` (or name in
+/// the variables `var` reads), whether they exist or not (#3416).
+pub fn cloud_dirs(
+    home: &Path,
+    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for key in ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"] {
+        if let Some(v) = var(key).filter(|v| !v.is_empty()) {
+            out.push(PathBuf::from(v));
+        }
+    }
+    for name in ["OneDrive", "Dropbox", "Google Drive", "iCloudDrive"] {
+        out.push(home.join(name));
+    }
+    let mut seen = Vec::new();
+    out.retain(|p| {
+        let fresh = !seen.contains(p);
+        seen.push(p.clone());
+        fresh
+    });
     out
 }
 
@@ -1258,6 +1508,9 @@ pub fn decode_picture(bytes: &[u8]) -> image::ImageResult<image::DynamicImage> {
 /// stands upright, #2167).
 pub fn decode_picture_within(bytes: &[u8], limit: u64) -> image::ImageResult<image::DynamicImage> {
     use image::ImageDecoder;
+    if is_jxl(bytes) {
+        return decode_jxl(bytes, limit);
+    }
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(limit);
@@ -1273,26 +1526,54 @@ pub fn decode_picture_within(bytes: &[u8], limit: u64) -> image::ImageResult<ima
     Ok(img)
 }
 
+/// A JPEG XL file: the bare codestream or the ISO container (#3210).
+pub fn is_jxl(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xff, 0x0a]) || bytes.starts_with(b"\0\0\0\x0cJXL \r\n\x87\n")
+}
+
+/// Decode a JPEG XL file within `limit` bytes (#3210). The codestream's
+/// own orientation is applied by the decoder; an Exif orientation in the
+/// file is not applied again, as the format says.
+fn decode_jxl(bytes: &[u8], limit: u64) -> image::ImageResult<image::DynamicImage> {
+    use image::ImageDecoder;
+    let mut decoder = jxl_oxide::integration::JxlDecoder::new(std::io::Cursor::new(bytes))?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(limit);
+    decoder.set_limits(limits.clone())?;
+    limits.reserve(decoder.total_bytes())?;
+    image::DynamicImage::from_decoder(decoder)
+}
+
 /// Whether the Exif orientation of picture file `bytes` turns it a
 /// quarter turn, so that its width and height (and its resolution
 /// across and down) change places.
 pub fn picture_turns_sideways(bytes: &[u8]) -> bool {
     use image::metadata::Orientation;
-    use image::ImageDecoder;
-    let Ok(reader) = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()
-    else {
-        return false;
-    };
-    let Ok(mut decoder) = reader.into_decoder() else {
-        return false;
-    };
     matches!(
-        decoder.orientation(),
-        Ok(Orientation::Rotate90
-            | Orientation::Rotate270
-            | Orientation::Rotate90FlipH
-            | Orientation::Rotate270FlipH)
+        picture_orientation(bytes),
+        Some(
+            Orientation::Rotate90
+                | Orientation::Rotate270
+                | Orientation::Rotate90FlipH
+                | Orientation::Rotate270FlipH
+        )
     )
+}
+
+/// The Exif orientation of picture file `bytes`, and its width and
+/// height as stored, from its header; `None` when it cannot be read.
+pub fn picture_header(bytes: &[u8]) -> Option<(image::metadata::Orientation, u32, u32)> {
+    use image::ImageDecoder;
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut decoder = reader.into_decoder().ok()?;
+    let (w, h) = decoder.dimensions();
+    Some((decoder.orientation().ok()?, w, h))
+}
+
+fn picture_orientation(bytes: &[u8]) -> Option<image::metadata::Orientation> {
+    picture_header(bytes).map(|(o, _, _)| o)
 }
 
 /// Keep bytes under a synthetic path so [`read`] finds them (browser).
@@ -1323,16 +1604,57 @@ pub fn forget(path: &Path) {
     });
 }
 
-/// Run the dialogs that finished since the last frame (browser, Android).
+/// Run the dialogs that finished since the last frame.
 /// Called once per frame before the interface is drawn.
-pub fn run_finished(app: &mut App) {
+pub fn run_finished(app: &mut App, _ctx: &egui::Context) {
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    {
+        let jobs = NATIVE_DIALOGS.with(|state| {
+            let mut state = state.borrow_mut();
+            state.context = Some(_ctx.clone());
+            let mut jobs = Vec::new();
+            while let Ok((id, paths)) = state.receiver.try_recv() {
+                if let Some(job) = state.pending.remove(&id) {
+                    if !paths.is_empty() {
+                        jobs.push((job, paths));
+                    }
+                }
+            }
+            jobs
+        });
+        // Drop the state borrow before invoking jobs so they can queue dialogs.
+        for (job, paths) in jobs {
+            job(app, paths);
+        }
+    }
     #[cfg(target_os = "android")]
     android_pickers::run_answers(app);
     let jobs: Vec<(Job, PathBuf)> = FINISHED.with(|f| std::mem::take(&mut *f.borrow_mut()));
     for (job, path) in jobs {
         job(app, path.clone());
-        forget(&path);
+        linger(path);
     }
+    // An upload is freed once the app no longer reads it: File > Import
+    // reads it again when the placement cursor is clicked or a PDF's
+    // question is answered, frames after its job ran (#3231).
+    let lingering: Vec<PathBuf> = LINGERING.with(|l| std::mem::take(&mut *l.borrow_mut()));
+    for path in lingering {
+        if app.reads_later(&path) {
+            linger(path);
+        } else {
+            forget(&path);
+        }
+    }
+}
+
+/// Free `path` on a frame when the app no longer reads it.
+fn linger(path: PathBuf) {
+    LINGERING.with(|l| {
+        let mut l = l.borrow_mut();
+        if !l.contains(&path) {
+            l.push(path);
+        }
+    });
 }
 
 /// The paths whose extension is one of `exts` (lower case; any case in
@@ -1551,6 +1873,7 @@ pub struct Dialog {
     filters: Vec<(String, Vec<String>)>,
     file_name: Option<String>,
     directory: Option<PathBuf>,
+    title: Option<String>,
 }
 
 impl Dialog {
@@ -1571,6 +1894,20 @@ impl Dialog {
         self
     }
 
+    /// The window title of the desktop dialog, such as "Export" (#3994).
+    pub fn set_title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    /// A menu command's name without its trailing dots, for a dialog's
+    /// title: "Import..." titles the Import window "Import".
+    pub fn command_title(key: &str) -> String {
+        crate::i18n::tr(key)
+            .trim_end_matches(['.', '…', ' '])
+            .to_string()
+    }
+
     /// The folder the desktop dialog opens in (ignored in a browser and
     /// on Android, whose pickers choose their own).
     pub fn set_directory(mut self, dir: impl Into<PathBuf>) -> Self {
@@ -1578,12 +1915,16 @@ impl Dialog {
         self
     }
 
-    /// Pick a file and run `then` with its path: at once natively, on a
-    /// later frame in a browser.
+    /// Pick a file and run `then` with its path on a later frame.
     pub fn pick_file(self, app: &mut App, then: impl FnOnce(&mut App, PathBuf) + 'static) {
         #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
-        if let Some(path) = self.native_pick() {
-            then(app, path);
+        {
+            let _ = app;
+            schedule_native_dialog(self.native_pick(false), move |app, paths| {
+                if let Some(path) = paths.into_iter().next() {
+                    then(app, path);
+                }
+            });
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -1638,14 +1979,8 @@ impl Dialog {
     pub fn pick_files(self, app: &mut App, then: impl FnOnce(&mut App, Vec<PathBuf>) + 'static) {
         #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
         {
-            let mut d = rfd::FileDialog::new();
-            for (name, exts) in &self.filters {
-                let exts: Vec<&str> = exts.iter().map(|e| e.as_str()).collect();
-                d = d.add_filter(name, &exts);
-            }
-            if let Some(paths) = d.pick_files() {
-                then(app, paths);
-            }
+            let _ = app;
+            schedule_native_dialog(self.native_pick(true), then);
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -1665,11 +2000,11 @@ impl Dialog {
         #[cfg(target_os = "android")]
         android_pickers::pick_into(key);
         #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
-        if let Some(path) = self.native_pick() {
-            PICKED.with(|p| {
-                p.borrow_mut().insert(key, path);
-            });
-        }
+        schedule_native_dialog(self.native_pick(false), move |_, paths| {
+            if let Some(path) = paths.into_iter().next() {
+                PICKED.with(|p| p.borrow_mut().insert(key, path));
+            }
+        });
         // The upload outlives this job: the dialog reads it on a later frame.
         #[cfg(target_arch = "wasm32")]
         self.web_pick(Box::new(move |_app, path| {
@@ -1681,7 +2016,7 @@ impl Dialog {
     }
 
     /// Choose where to save and run `then` with that path; `then` writes
-    /// with [`write`]. A save dialog natively, at once; in a browser there
+    /// with [`write`]. A save dialog natively, on a later frame; in a browser there
     /// is no dialog: the path is `/download/<file name>` and the write
     /// becomes a download; on Android the system's picker asks where,
     /// and `then` runs on a later frame with the document it made.
@@ -1692,9 +2027,19 @@ impl Dialog {
             let name = self.suggested_name();
             android_pickers::save(&name, Box::new(then));
         }
-        #[cfg(not(target_os = "android"))]
-        if let Some(path) = self.save_path() {
-            then(app, path);
+        #[cfg(target_arch = "wasm32")]
+        {
+            let name = self.file_name.unwrap_or_else(|| "download".into());
+            then(app, PathBuf::from("/download").join(name));
+        }
+        #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+        {
+            let _ = app;
+            schedule_native_dialog(self.native_save(), move |app, paths| {
+                if let Some(path) = paths.into_iter().next() {
+                    then(app, path);
+                }
+            });
         }
     }
 
@@ -1727,15 +2072,25 @@ impl Dialog {
         }
     }
 
-    /// The path to save to, or `None` when the user cancels: a save
-    /// dialog natively, `/download/<file name>` in a browser (write it with
-    /// [`write`] to download it). On Android, where the picker answers on
-    /// a later frame (see [`Dialog::save_file`]), the few callers that
-    /// need a path at once get one in the app's own documents folder.
-    pub fn save_path(self) -> Option<PathBuf> {
-        if WEB {
+    /// Choose a save path and keep it for [`take_picked`] on a later frame.
+    /// Browser and Android paths retain their existing local defaults.
+    pub fn save_path_into(self, key: &str) {
+        #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+        {
+            let key = key.to_string();
+            schedule_native_dialog(self.native_save(), move |_, paths| {
+                if let Some(path) = paths.into_iter().next() {
+                    PICKED.with(|p| p.borrow_mut().insert(key, path));
+                }
+            });
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
             let name = self.file_name.unwrap_or_else(|| "download".into());
-            return Some(PathBuf::from("/download").join(name));
+            PICKED.with(|p| {
+                p.borrow_mut()
+                    .insert(key.to_string(), PathBuf::from("/download").join(name))
+            });
         }
         #[cfg(target_os = "android")]
         {
@@ -1745,30 +2100,8 @@ impl Dialog {
                 log::warn!("cannot create {}: {e}", dir.display());
             }
             log::info!("saved without a picker to {}", dir.display());
-            return Some(dir.join(name));
+            PICKED.with(|p| p.borrow_mut().insert(key.to_string(), dir.join(name)));
         }
-        // Unit tests answer the dialog themselves (see `test_save`).
-        #[cfg(all(test, not(any(target_arch = "wasm32", target_os = "android"))))]
-        {
-            return test_save::ask(self);
-        }
-        #[cfg(not(any(target_arch = "wasm32", target_os = "android", test)))]
-        {
-            let mut d = rfd::FileDialog::new();
-            for (name, exts) in &self.filters {
-                let exts: Vec<&str> = exts.iter().map(|e| e.as_str()).collect();
-                d = d.add_filter(name, &exts);
-            }
-            if let Some(n) = &self.file_name {
-                d = d.set_file_name(n);
-            }
-            if let Some(dir) = self.directory.as_ref().filter(|d| d.is_dir()) {
-                d = d.set_directory(dir);
-            }
-            return d.save_file();
-        }
-        #[allow(unreachable_code)]
-        None
     }
 
     /// The filters offered, in order: a name and its extensions.
@@ -1783,6 +2116,12 @@ impl Dialog {
         self.file_name.as_deref()
     }
 
+    /// The dialog window's title.
+    #[cfg(test)]
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
     /// The folder the dialog opens in.
     #[cfg(test)]
     pub fn directory(&self) -> Option<&Path> {
@@ -1790,17 +2129,76 @@ impl Dialog {
     }
 
     #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
-    fn native_pick(&self) -> Option<PathBuf> {
-        let mut d = rfd::FileDialog::new();
+    fn native_dialog(&self) -> rfd::AsyncFileDialog {
+        let mut d = rfd::AsyncFileDialog::new();
         for (name, exts) in &self.filters {
-            let exts: Vec<&str> = exts.iter().map(|e| e.as_str()).collect();
-            d = d.add_filter(name, &exts);
+            d = d.add_filter(name, exts);
         }
-        d.pick_file()
+        if let Some(name) = &self.file_name {
+            d = d.set_file_name(name);
+        }
+        if let Some(dir) = self.directory.as_ref().filter(|d| d.is_dir()) {
+            d = d.set_directory(dir);
+        }
+        if let Some(title) = &self.title {
+            d = d.set_title(title);
+        }
+        d
     }
 
-    /// The browser's picker for several files: each is kept under
-    /// `/upload/<name>` and `then` runs with them all on a later frame.
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    fn native_pick(self, many: bool) -> impl std::future::Future<Output = Vec<PathBuf>> + Send {
+        #[cfg(test)]
+        {
+            let _ = (self.native_dialog(), many);
+            std::future::ready(test_pick::ask())
+        }
+        #[cfg(not(test))]
+        {
+            let dialog = self.native_dialog();
+            let one = (!many).then(|| dialog.clone().pick_file());
+            let multiple = many.then(|| dialog.pick_files());
+            async move {
+                if let Some(future) = one {
+                    future
+                        .await
+                        .into_iter()
+                        .map(|f| f.path().to_path_buf())
+                        .collect()
+                } else if let Some(future) = multiple {
+                    future
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|f| f.path().to_path_buf())
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+    }
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    fn native_save(self) -> impl std::future::Future<Output = Vec<PathBuf>> + Send {
+        #[cfg(test)]
+        {
+            let _ = self.native_dialog();
+            std::future::ready(test_save::ask(self).into_iter().collect())
+        }
+        #[cfg(not(test))]
+        {
+            let future = self.native_dialog().save_file();
+            async move {
+                future
+                    .await
+                    .into_iter()
+                    .map(|f| f.path().to_path_buf())
+                    .collect()
+            }
+        }
+    }
+
     #[cfg(target_arch = "wasm32")]
     fn web_pick_many(self, then: Box<dyn FnOnce(&mut App, Vec<PathBuf>)>) {
         let d = self.web_dialog();
@@ -1823,8 +2221,8 @@ impl Dialog {
             let job: Job = Box::new(move |app: &mut App, _| {
                 let rest = paths.clone();
                 then(app, paths);
-                for p in rest.iter().skip(1) {
-                    forget(p);
+                for p in rest.into_iter().skip(1) {
+                    linger(p);
                 }
             });
             FINISHED.with(|f| f.borrow_mut().push((job, first)));
@@ -1877,6 +2275,20 @@ fn download(_name: &str, _bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(all(test, not(any(target_arch = "wasm32", target_os = "android"))))]
+mod test_pick {
+    use super::*;
+    thread_local! {
+        static ANSWERS: RefCell<std::collections::VecDeque<Vec<PathBuf>>> = const { RefCell::new(std::collections::VecDeque::new()) };
+    }
+    pub fn answer(paths: Vec<PathBuf>) {
+        ANSWERS.with(|a| a.borrow_mut().push_back(paths));
+    }
+    pub fn ask() -> Vec<PathBuf> {
+        ANSWERS.with(|a| a.borrow_mut().pop_front().unwrap_or_default())
+    }
+}
+
 /// Unit tests never open the system's save dialog: each dialog asked
 /// for is kept for the test to look at, and it gets the next answer the
 /// test queued (`None` for Cancel); with nothing queued it is cancelled.
@@ -1888,6 +2300,22 @@ pub mod test_save {
     thread_local! {
         static ANSWERS: RefCell<VecDeque<Option<PathBuf>>> = const { RefCell::new(VecDeque::new()) };
         static ASKED: RefCell<Vec<Dialog>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Dispatch queued native test answers as later UI frames would.
+    pub fn finish(app: &mut super::App) {
+        #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+        {
+            let start = std::time::Instant::now();
+            let ctx = egui::Context::default();
+            while super::NATIVE_DIALOGS.with(|s| !s.borrow().pending.is_empty()) {
+                assert!(start.elapsed() < std::time::Duration::from_secs(5));
+                super::run_finished(app, &ctx);
+                std::thread::yield_now();
+            }
+        }
+        #[cfg(any(target_arch = "wasm32", target_os = "android"))]
+        let _ = app;
     }
 
     /// The answer of the next save dialog: the path chosen, or `None`
@@ -1911,6 +2339,351 @@ pub mod test_save {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    fn queue_native_test_job(job: NativeJob, paths: Vec<PathBuf>) {
+        let (id, sender) = NATIVE_DIALOGS.with(|state| {
+            let mut state = state.borrow_mut();
+            (
+                state.register(job).expect("request ID"),
+                state.sender.clone(),
+            )
+        });
+        std::thread::spawn(move || sender.send((id, paths)).expect("completion"))
+            .join()
+            .expect("worker");
+    }
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    #[test]
+    fn native_dialog_jobs_wait_for_ui_dispatch() {
+        let mut app = App::headless();
+        let called = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let result = called.clone();
+        queue_native_test_job(
+            Box::new(move |_, paths| {
+                result
+                    .borrow_mut()
+                    .push((std::thread::current().id(), paths));
+            }),
+            vec![PathBuf::from("drawing.tdraw")],
+        );
+        assert!(called.borrow().is_empty());
+        run_finished(&mut app, &egui::Context::default());
+        assert_eq!(
+            *called.borrow(),
+            vec![(
+                std::thread::current().id(),
+                vec![PathBuf::from("drawing.tdraw")]
+            )]
+        );
+        run_finished(&mut app, &egui::Context::default());
+        assert_eq!(called.borrow().len(), 1);
+    }
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    #[test]
+    fn cancelled_native_dialog_releases_job() {
+        let mut app = App::headless();
+        let retained = std::rc::Rc::new(());
+        let captured = retained.clone();
+        queue_native_test_job(
+            Box::new(move |_, _| {
+                drop(captured);
+                panic!("cancelled job must not run");
+            }),
+            Vec::new(),
+        );
+        assert_eq!(std::rc::Rc::strong_count(&retained), 2);
+        run_finished(&mut app, &egui::Context::default());
+        assert_eq!(std::rc::Rc::strong_count(&retained), 1);
+        assert!(NATIVE_DIALOGS.with(|state| state.borrow().pending.is_empty()));
+    }
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    #[test]
+    fn native_dialog_results_match_request_ids() {
+        let mut app = App::headless();
+        let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let register = |label| {
+            NATIVE_DIALOGS.with(|state| {
+                let seen = seen.clone();
+                let mut state = state.borrow_mut();
+                let id = state
+                    .register(Box::new(move |_, paths| {
+                        seen.borrow_mut().push((label, paths))
+                    }))
+                    .expect("request ID");
+                (id, state.sender.clone())
+            })
+        };
+        let (first, sender) = register("first");
+        let (second, _) = register("second");
+        assert!(second > first);
+        std::thread::spawn(move || {
+            sender
+                .send((second, vec![PathBuf::from("b.svg")]))
+                .expect("second");
+            sender
+                .send((first, vec![PathBuf::from("a.svg")]))
+                .expect("first");
+        })
+        .join()
+        .expect("worker");
+        run_finished(&mut app, &egui::Context::default());
+        assert_eq!(
+            *seen.borrow(),
+            vec![
+                ("second", vec![PathBuf::from("b.svg")]),
+                ("first", vec![PathBuf::from("a.svg")])
+            ]
+        );
+    }
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    #[test]
+    fn native_dialog_dispatch_requests_repaint() {
+        let mut app = App::headless();
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+            output.textures_delta.clear();
+        }
+        run_finished(&mut app, &ctx);
+        let (sent, received) = std::sync::mpsc::channel();
+        ctx.set_request_repaint_callback(move |_| {
+            let _ = sent.send(std::thread::current().id());
+        });
+        let called = std::rc::Rc::new(RefCell::new(None));
+        let result = called.clone();
+        schedule_native_dialog(
+            async { vec![PathBuf::from("picked.svg")] },
+            move |_, paths| {
+                *result.borrow_mut() = Some((std::thread::current().id(), paths));
+            },
+        );
+        let worker = received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker repaint");
+        assert_ne!(worker, std::thread::current().id());
+        assert!(called.borrow().is_none());
+        run_finished(&mut app, &ctx);
+        assert_eq!(
+            *called.borrow(),
+            Some((
+                std::thread::current().id(),
+                vec![PathBuf::from("picked.svg")]
+            ))
+        );
+    }
+
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    #[test]
+    fn native_picker_configuration_keeps_filters_name_and_directory() {
+        let dir = std::env::temp_dir();
+        let dialog = Dialog::new()
+            .add_filter("PDF", &["pdf"])
+            .add_filter("Images", &["png", "jpg"])
+            .set_file_name("drawing.pdf")
+            .set_directory(&dir)
+            .set_title("Export");
+        let config = format!("{:?}", dialog.native_dialog());
+        for expected in ["PDF", "pdf", "Images", "png", "jpg", "drawing.pdf"] {
+            assert!(config.contains(expected), "{config}");
+        }
+        assert!(config.contains("Export"), "{config}");
+        assert!(config.contains(&format!("{:?}", dir)));
+        let invalid = Dialog::new().set_directory(dir.join("missing-tracedraw-dialog-dir"));
+        assert!(format!("{:?}", invalid.native_dialog()).contains("starting_directory: None"));
+    }
+
+    /// The Import and Export windows are titled after their commands,
+    /// not with the system's "Open" and "Save As" (#3994).
+    #[test]
+    fn import_and_export_dialogs_are_titled_after_their_commands() {
+        assert_eq!(Dialog::command_title("menu.file.import"), "Import");
+        assert_eq!(Dialog::command_title("menu.file.export"), "Export");
+    }
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    #[test]
+    fn native_file_pick_dispatches_one_path() {
+        let mut app = App::headless();
+        run_finished(&mut app, &egui::Context::default());
+        test_pick::answer(vec![PathBuf::from("chosen.svg")]);
+        let seen = std::rc::Rc::new(RefCell::new(None));
+        let result = seen.clone();
+        Dialog::new().pick_file(&mut app, move |_, path| *result.borrow_mut() = Some(path));
+        assert!(seen.borrow().is_none());
+        test_save::finish(&mut app);
+        assert_eq!(*seen.borrow(), Some(PathBuf::from("chosen.svg")));
+    }
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    #[test]
+    fn native_multi_pick_dispatches_all_paths_in_order() {
+        let mut app = App::headless();
+        run_finished(&mut app, &egui::Context::default());
+        test_pick::answer(vec![PathBuf::from("z.svg"), PathBuf::from("a.svg")]);
+        let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let result = seen.clone();
+        Dialog::new().pick_files(&mut app, move |_, paths| *result.borrow_mut() = paths);
+        assert!(seen.borrow().is_empty());
+        test_save::finish(&mut app);
+        assert_eq!(
+            *seen.borrow(),
+            vec![PathBuf::from("z.svg"), PathBuf::from("a.svg")]
+        );
+    }
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    #[test]
+    fn native_picker_saves_and_keyed_results_are_deferred_and_one_shot() {
+        let mut app = App::headless();
+        run_finished(&mut app, &egui::Context::default());
+        test_save::answer(Some(PathBuf::from("out.pdf")));
+        let seen = std::rc::Rc::new(RefCell::new(None));
+        let result = seen.clone();
+        Dialog::new().save_file(&mut app, move |_, path| *result.borrow_mut() = Some(path));
+        assert!(seen.borrow().is_none());
+        test_save::finish(&mut app);
+        assert_eq!(*seen.borrow(), Some(PathBuf::from("out.pdf")));
+        test_save::answer(Some(PathBuf::from("browse.pdf")));
+        Dialog::new().save_path_into("test-save-path");
+        assert!(take_picked("test-save-path").is_none());
+        test_save::finish(&mut app);
+        assert_eq!(
+            take_picked("test-save-path"),
+            Some(PathBuf::from("browse.pdf"))
+        );
+        assert!(take_picked("test-save-path").is_none());
+        test_pick::answer(vec![PathBuf::from("key.svg")]);
+        Dialog::new().pick_into("test-pick");
+        assert!(take_picked("test-pick").is_none());
+        test_save::finish(&mut app);
+        assert_eq!(take_picked("test-pick"), Some(PathBuf::from("key.svg")));
+        assert!(take_picked("test-pick").is_none());
+        test_save::answer(None);
+        Dialog::new().save_file(&mut app, |_, _| panic!("cancelled save"));
+        test_pick::answer(Vec::new());
+        Dialog::new().pick_file(&mut app, |_, _| panic!("cancelled pick"));
+        test_pick::answer(Vec::new());
+        Dialog::new().pick_files(&mut app, |_, _| panic!("cancelled multi pick"));
+        test_save::finish(&mut app);
+    }
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    #[test]
+    fn folder_pick_is_deferred_until_ui_dispatch() {
+        let mut app = App::headless();
+        run_finished(&mut app, &egui::Context::default());
+        let token = match FolderUse::ExportAssets.action() {
+            FolderAction::PickFolder(token) => token,
+            other => panic!("desktop folder action: {other:?}"),
+        };
+        let key = "test-folder-pick";
+        let path = PathBuf::from("picked-folder");
+        test_pick::answer(vec![path.clone()]);
+        pick_folder_into(token, None, key);
+        assert_eq!(take_picked(key), None);
+        test_save::finish(&mut app);
+        assert_eq!(take_picked(key), Some(path));
+        assert_eq!(take_picked(key), None);
+    }
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    #[test]
+    fn folder_cancel_keeps_existing_folder() {
+        let mut app = App::headless();
+        run_finished(&mut app, &egui::Context::default());
+        let token = match FolderUse::FontFolder.action() {
+            FolderAction::PickFolder(token) => token,
+            other => panic!("desktop folder action: {other:?}"),
+        };
+        let key = "test-folder-cancel";
+        let existing = PathBuf::from("existing-folder");
+        PICKED.with(|p| p.borrow_mut().insert(key.into(), existing.clone()));
+        test_pick::answer(Vec::new());
+        pick_folder_into(token, None, key);
+        test_save::finish(&mut app);
+        assert_eq!(take_picked(key), Some(existing));
+    }
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    #[test]
+    fn folder_pick_from_preserves_start_directory() {
+        let dir = std::env::temp_dir();
+        let token = match FolderUse::SaveDrawing.action() {
+            FolderAction::PickFolder(token) => token,
+            other => panic!("desktop folder action: {other:?}"),
+        };
+        let config = format!("{:?}", native_folder_dialog(token, Some(&dir)));
+        assert!(config.contains(&format!("starting_directory: Some({dir:?})")), "{config}");
+    }
+
+    /// The cloud folders offered in the Save Drawing dialog: OneDrive
+    /// where Windows names it, and the folders the cloud programs make
+    /// in the home folder, each once (#3416).
+    #[test]
+    fn cloud_folders_come_from_the_home_folder_and_onedrive() {
+        let home = Path::new("/home/me");
+        let var = |k: &str| match k {
+            "OneDrive" => Some(std::ffi::OsString::from("/home/me/OneDrive")),
+            "OneDriveCommercial" => Some(std::ffi::OsString::from("/home/me/OneDrive - Work")),
+            _ => None,
+        };
+        let dirs = cloud_dirs(home, &var);
+        assert_eq!(
+            dirs,
+            vec![
+                home.join("OneDrive"),
+                home.join("OneDrive - Work"),
+                home.join("Dropbox"),
+                home.join("Google Drive"),
+                home.join("iCloudDrive"),
+            ]
+        );
+    }
+
+    /// A write that fails half way (a full disk, an error while the
+    /// drawing is written) leaves the file it was replacing as it was:
+    /// it was written over from the start and left cut short. A write
+    /// that succeeds replaces it and leaves no `.part` file; a new file
+    /// is made the same way.
+    #[test]
+    fn a_failed_write_keeps_the_file_it_was_replacing() {
+        let dir =
+            std::env::temp_dir().join(format!("tracedraw-replace-{}", crate::recovery::new_id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("drawing.tdraw");
+        std::fs::write(&path, b"the old drawing").expect("old");
+        let failed = write_with(&path, |w| {
+            w.write_all(b"half of the new")?;
+            Err(std::io::Error::other("no space left on device"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(std::fs::read(&path).expect("read"), b"the old drawing");
+        let names = |dir: &Path| -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(dir)
+                .expect("list")
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(&dir), vec!["drawing.tdraw"], "no .part left");
+        write_with(&path, |w| w.write_all(b"the new drawing")).expect("save");
+        assert_eq!(std::fs::read(&path).expect("read"), b"the new drawing");
+        write(&path, b"shorter").expect("write");
+        assert_eq!(std::fs::read(&path).expect("read"), b"shorter");
+        let new = dir.join("new.cdr");
+        write(&new, b"made").expect("new");
+        assert_eq!(std::fs::read(&new).expect("read"), b"made");
+        assert_eq!(names(&dir), vec!["drawing.tdraw", "new.cdr"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Names in every script stay as typed; only direction marks, control
     /// characters and what the system refuses change.
@@ -2024,11 +2797,66 @@ mod tests {
                 path.clone(),
             ))
         });
-        run_finished(&mut app);
+        run_finished(&mut app, &egui::Context::default());
         assert_eq!(app.status, "got /upload/t.txt");
-        run_finished(&mut app);
+        run_finished(&mut app, &egui::Context::default());
         assert_eq!(app.status, "got /upload/t.txt");
         assert!(STORE.with(|s| s.borrow().get(&path).is_none()));
+    }
+
+    /// An upload File > Import still reads on a later frame (the file
+    /// waiting for its place, the ones picked with it, a PDF's question)
+    /// stays until nothing does; it was freed as soon as the picker's job
+    /// ran, so the import found nothing in a browser (#3231).
+    #[test]
+    fn an_upload_stays_while_an_import_still_reads_it() {
+        let mut app = App::headless();
+        let first = PathBuf::from("/upload/two-pages.ai");
+        let second = PathBuf::from("/upload/second.pdf");
+        store(&first, b"%PDF-1.4".to_vec());
+        store(&second, b"%PDF-1.4".to_vec());
+        let paths = vec![first.clone(), second.clone()];
+        FINISHED.with(|f| {
+            f.borrow_mut().push((
+                Box::new(move |app: &mut App, _| {
+                    app.import_placing = Some(crate::import_place::ImportPlacing {
+                        path: paths[0].clone(),
+                        drag_from: None,
+                    });
+                    app.import_queue = paths[1..].iter().cloned().collect();
+                    linger(paths[1].clone());
+                }),
+                first.clone(),
+            ))
+        });
+        let kept = |p: &PathBuf| STORE.with(|s| s.borrow().contains_key(p));
+        run_finished(&mut app, &egui::Context::default());
+        run_finished(&mut app, &egui::Context::default());
+        assert!(kept(&first) && kept(&second));
+        // Placed: the PDF asks how to read its text, then reads it again.
+        app.import_placing = None;
+        app.dialog =
+            crate::ui::dialogs::Dialog::PdfText(crate::ui::pdf_import_dialog::PdfTextState {
+                path: first.clone(),
+                import: true,
+                curves: false,
+                paragraphs: false,
+                picture: false,
+                dpi: 300.0,
+                page_size: None,
+                all_pages: true,
+                range: "1".into(),
+                reduce_pictures: true,
+                dont_ask: false,
+            });
+        run_finished(&mut app, &egui::Context::default());
+        assert!(kept(&first) && kept(&second));
+        app.dialog = crate::ui::dialogs::Dialog::None;
+        run_finished(&mut app, &egui::Context::default());
+        assert!(!kept(&first) && kept(&second));
+        app.import_queue.clear();
+        run_finished(&mut app, &egui::Context::default());
+        assert!(!kept(&second));
     }
 
     /// A document the Android picker returned is named by its URI and its
@@ -2134,6 +2962,8 @@ mod tests {
                 OpenFiles,
                 Unavailable("folder.backup_web"),
                 Unavailable("folder.backup_web"),
+                Unavailable("folder.save_desktop"),
+                Unavailable("folder.pattern_desktop"),
             ]
         );
         assert_eq!(
@@ -2147,6 +2977,8 @@ mod tests {
                 OpenFiles,
                 Unavailable("folder.backup_android"),
                 Unavailable("folder.backup_android"),
+                Unavailable("folder.save_desktop"),
+                Unavailable("folder.pattern_desktop"),
             ]
         );
         assert_eq!(
@@ -2228,16 +3060,17 @@ mod tests {
 
     /// No dialog shows the folder dialog on its own: each one asks
     /// `FolderUse::action` for the running platform, whose leave to pick
-    /// a folder (the token [`pick_folder`] takes) exists on the desktop
+    /// a folder (the token [`pick_folder_into`] takes) exists on the desktop
     /// only. The six dialogs of #1399 and Options all go through it.
     #[test]
     fn no_dialog_picks_a_folder_without_asking_the_platform() {
         let sources = app_sources();
         for (path, text) in &sources {
-            assert!(!text.contains("pick_folder()"), "{path}");
+            assert!(!text.contains("rfd::FileDialog"), "{path}");
+            assert!(!text.contains("files::pick_folder("), "{path}");
             assert!(!text.contains("folder_action("), "{path}");
             assert!(!text.contains("FolderToken"), "{path}");
-            if text.contains("files::pick_folder(") {
+            if text.contains("files::pick_folder_into(") || text.contains("files::pick_folder_with(") {
                 assert!(text.contains(".action()"), "{path}");
             }
         }
@@ -2249,6 +3082,7 @@ mod tests {
             "options.rs",
             "picture_mosaic_docker.rs",
             "export_assets.rs",
+            "save_as.rs",
         ] {
             let (_, text) = sources
                 .iter()
@@ -2260,12 +3094,12 @@ mod tests {
 
     /// Presets, masks, scripts, macro exports and palettes are saved
     /// through `Dialog::save_file`, which asks the system's save picker
-    /// on Android (#1402): `save_path`, which saves there without asking,
+    /// on Android (#1402): `save_path_into`, which chooses a local path there without asking,
     /// is left to Export as PDF's Browse, which Android does not show.
     #[test]
     fn saves_ask_where_on_android() {
         for (path, text) in app_sources() {
-            if text.contains(".save_path()") {
+            if text.contains(".save_path_into(") {
                 assert!(path.ends_with("publish_pdf.rs"), "{path}");
             }
         }

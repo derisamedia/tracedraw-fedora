@@ -45,7 +45,7 @@ impl Canvas {
         (y + 14).min(self.h)
     }
 
-    fn save(&self, path: &std::path::Path, (x0, y0, x1, y1): (usize, usize, usize, usize)) {
+    pub(crate) fn save(&self, path: &std::path::Path, (x0, y0, x1, y1): (usize, usize, usize, usize)) {
         let mut img = image::RgbaImage::new((x1 - x0) as u32, (y1 - y0) as u32);
         for y in y0..y1 {
             for x in x0..x1 {
@@ -104,7 +104,7 @@ impl Raster {
 pub(crate) fn rasterise(w: usize, h: usize, ppp: f32, body: impl FnOnce(&egui::Painter)) -> Raster {
     let ctx = egui::Context::default();
     Raster {
-        canvas: crate::soft_canvas::rasterise(&ctx, w, h, ppp, body),
+        canvas: crate::soft_canvas::rasterise(&ctx, &mut Textures::default(), w, h, ppp, body),
     }
 }
 
@@ -265,6 +265,8 @@ fn shots() -> Vec<(String, Shot, bool)> {
         ("menu.table.create_new_table", false),
         ("menu.object.create_pattern", false),
         ("menu.object.insert_barcode", false),
+        ("menu.object.insert_flare", false),
+        ("menu.object.transform_each", false),
         ("menu.bitmaps.convert_to_bitmap", false),
         ("menu.bitmaps.straighten_image", true),
         ("menu.bitmaps.resample", true),

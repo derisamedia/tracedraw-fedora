@@ -1161,6 +1161,7 @@ mod tests {
                 sharpness: 0.5,
                 complex: None,
                 twist: 0.0,
+                bend: 0.0,
             },
         ];
         for kind in kinds {
@@ -1366,6 +1367,46 @@ mod tests {
             .expect("the object");
         assert_eq!(ib + 1, ir, "just behind its object");
         assert_eq!(app.selection, vec![group]);
+    }
+
+    /// #3831: ungrouping a group with a drop shadow keeps the shadow where
+    /// it showed: the bitmap Break Drop Shadow Apart makes, just behind
+    /// the group's objects, in the same undo step; the objects get no
+    /// shadow of their own. One undo gives the group and its shadow back.
+    #[test]
+    fn ungrouping_keeps_the_groups_drop_shadow() {
+        let (mut app, a) = app_with_rect();
+        let b = app
+            .new_shape(ShapeKind::Rect {
+                rect: Rect::new(50.0, 50.0, 90.0, 100.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect");
+        app.select(vec![a, b]);
+        app.group_selection();
+        let g = app.selection[0];
+        app.set_shadow(Some(Shadow::default()), false);
+        assert!(shadow(&app, g).is_some());
+        let steps = app.engine.history_labels().0.len();
+        app.ungroup_selection();
+        assert_eq!(app.engine.history_labels().0.len(), steps + 1, "one undo step");
+        assert_eq!(app.engine.undo_label(), Some("Ungroup"));
+        let layer = &app.doc().pages[0].layers[0];
+        let order: Vec<ShapeId> = layer.shapes.iter().map(|s| s.id).collect();
+        assert_eq!(order.len(), 3, "{order:?}");
+        let bmp = &layer.shapes[0];
+        assert!(matches!(bmp.kind, ShapeKind::Bitmap { .. }), "the shadow, at the back");
+        assert_eq!(&order[1..], &[a, b]);
+        assert!(shadow(&app, a).is_none() && shadow(&app, b).is_none());
+        app.undo();
+        assert!(shadow(&app, g).is_some());
+        assert_eq!(app.doc().pages[0].layers[0].shapes.len(), 1);
+        // A group without a shadow comes apart as before.
+        app.select(vec![g]);
+        app.set_shadow(None, false);
+        app.ungroup_selection();
+        assert_eq!(app.doc().pages[0].layers[0].shapes.len(), 2);
     }
 
     #[test]

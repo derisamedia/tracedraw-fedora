@@ -15,6 +15,8 @@ use crate::trace::{self, Settings, Stats, Traced};
 use egui::{ColorImage, TextureHandle, TextureOptions};
 use image::RgbaImage;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use tracedraw_core::ShapeId;
@@ -82,6 +84,8 @@ pub struct Outcome {
     pub colors: Arc<Vec<([u8; 3], usize)>>,
     /// Mean centreline stroke width, pixels of what was traced.
     pub stroke_px: f64,
+    /// The size, pixels, of what was traced (`traced`'s space).
+    pub trace_size: (u32, u32),
     pub stats: Stats,
     pub after: ColorImage,
     pub wire: ColorImage,
@@ -102,6 +106,8 @@ pub struct Shown {
     pub traced: Arc<Vec<Traced>>,
     pub colors: Arc<Vec<([u8; 3], usize)>>,
     pub stroke_px: f64,
+    /// The size, pixels, of what was traced (`traced`'s space).
+    pub trace_size: (u32, u32),
     pub stats: Stats,
     pub after: TextureHandle,
     pub wire: TextureHandle,
@@ -162,6 +168,11 @@ pub struct Live {
     pub started: usize,
     /// How many times a trace on show was only given new colours.
     pub recolored: usize,
+    /// The threads the traces were made on that may still be running:
+    /// one stopped, or one whose last result is in, still asks for a
+    /// frame before it ends.
+    #[cfg(not(target_arch = "wasm32"))]
+    workers: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl Live {
@@ -294,6 +305,7 @@ impl Live {
             traced: o.traced,
             colors: o.colors,
             stroke_px: o.stroke_px,
+            trace_size: o.trace_size,
             stats: o.stats,
             after,
             wire,
@@ -331,7 +343,10 @@ impl Live {
             }
         };
         #[cfg(not(target_arch = "wasm32"))]
-        std::thread::spawn(work);
+        {
+            self.workers.retain(|t| !t.is_finished());
+            self.workers.push(std::thread::spawn(work));
+        }
         #[cfg(target_arch = "wasm32")]
         work();
         self.job = Some(Job {
@@ -403,6 +418,16 @@ impl Live {
     /// Whether Best optimization is running.
     pub fn optimizing(&self) -> bool {
         self.search.is_some()
+    }
+
+    /// Wait for every thread a trace was made on to end, so that none
+    /// asks for a frame later: what a test of the frames after a trace
+    /// waits for, instead of for some time to pass.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub fn join_workers(&mut self) {
+        for t in self.workers.drain(..) {
+            let _ = t.join();
+        }
     }
 
     /// Whether a trace is being made or waiting to start.
@@ -539,6 +564,7 @@ fn outcome(
         traced,
         colors,
         stroke_px,
+        trace_size: (tw, th),
         stats,
         after: color_image(&after),
         wire: color_image(&wire),
@@ -799,7 +825,10 @@ mod tests {
         live.poll(&ctx);
         assert_eq!(live.started, 1);
         let t0 = Instant::now();
-        while live.busy() && t0.elapsed() < Duration::from_secs(20) {
+        // The quick look of a 700 px picture, waiting for a busy worker
+        // thread: on starved runners this crossed 20 s and failed the
+        // test although the trace was on its way.
+        while live.busy() && t0.elapsed() < Duration::from_secs(120) {
             std::thread::sleep(Duration::from_millis(2));
             live.poll(&ctx);
         }
@@ -887,7 +916,9 @@ mod tests {
         assert_eq!(live.started, 1);
         assert!(live.busy());
         let t0 = Instant::now();
-        while live.full(1, 0).is_none() && t0.elapsed() < Duration::from_secs(20) {
+        // A whole trace of the 700 px picture takes tens of seconds on
+        // one core of a slow machine: 20 s crossed on CI runners.
+        while live.full(1, 0).is_none() && t0.elapsed() < Duration::from_secs(120) {
             std::thread::sleep(Duration::from_millis(2));
             live.poll(&ctx);
         }
@@ -907,7 +938,7 @@ mod tests {
         live.poll(&ctx);
         assert_eq!(live.started, 2);
         let t0 = Instant::now();
-        while live.full(3, 0).is_none() && t0.elapsed() < Duration::from_secs(20) {
+        while live.full(3, 0).is_none() && t0.elapsed() < Duration::from_secs(120) {
             std::thread::sleep(Duration::from_millis(2));
             live.poll(&ctx);
         }
@@ -918,7 +949,9 @@ mod tests {
 
     fn settle(live: &mut Live, ctx: &egui::Context, key: u64, look: u64) {
         let t0 = Instant::now();
-        while live.full(key, look).is_none() && t0.elapsed() < Duration::from_secs(20) {
+        // A whole trace takes tens of seconds on one core; 20 s crossed
+        // on slow CI runners.
+        while live.full(key, look).is_none() && t0.elapsed() < Duration::from_secs(120) {
             std::thread::sleep(Duration::from_millis(2));
             live.poll(ctx);
         }
@@ -1004,14 +1037,23 @@ mod tests {
         live.clear();
         assert!(flag.load(Ordering::Relaxed));
         assert!(!live.is_active());
+        // Wait for the thread to end by its own signal: its sender drops
+        // when it returns. A slow or busy test machine may take a while to
+        // reach the next cancel check, so the deadline is only a guard
+        // against a trace that never stops. What proves the cancel is that
+        // the full trace never arrives.
         let t0 = Instant::now();
         loop {
-            match rx.try_recv() {
-                Err(TryRecvError::Disconnected) => break,
-                _ => std::thread::sleep(Duration::from_millis(2)),
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Err(RecvTimeoutError::Disconnected) => break,
+                Ok(outcome) => assert!(
+                    !matches!(outcome.stage, Stage::Full),
+                    "the full trace arrived after the dialog closed"
+                ),
+                Err(RecvTimeoutError::Timeout) => {}
             }
             assert!(
-                t0.elapsed() < Duration::from_secs(3),
+                t0.elapsed() < Duration::from_secs(120),
                 "the trace still runs after the dialog closed"
             );
         }

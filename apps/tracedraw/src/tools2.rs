@@ -191,6 +191,49 @@ pub fn grid_path(rect: Rect, rows: u32, cols: u32) -> BezPath {
     p
 }
 
+/// The rings of a radial grid in `rect`, outermost first: `rings`
+/// ellipses evenly spaced from the middle out to the box's edge.
+pub fn radial_rings(rect: Rect, rings: u32) -> Vec<Rect> {
+    let n = rings.max(1);
+    let c = rect.center();
+    (0..n)
+        .map(|i| {
+            let k = (n - i) as f64 / n as f64;
+            let (rx, ry) = (rect.width() / 2.0 * k, rect.height() / 2.0 * k);
+            Rect::new(c.x - rx, c.y - ry, c.x + rx, c.y + ry)
+        })
+        .collect()
+}
+
+/// The spokes of a radial grid in `rect`: `spokes` lines from the middle
+/// to the outer ring, evenly round, the first pointing up.
+pub fn radial_spokes(rect: Rect, spokes: u32) -> Vec<(Point, Point)> {
+    let c = rect.center();
+    let (rx, ry) = (rect.width() / 2.0, rect.height() / 2.0);
+    (0..spokes)
+        .map(|i| {
+            let a = std::f64::consts::FRAC_PI_2 + std::f64::consts::TAU * i as f64 / spokes as f64;
+            (c, Point::new(c.x + rx * a.cos(), c.y + ry * a.sin()))
+        })
+        .collect()
+}
+
+/// A radial grid's outline, for the preview: its rings and spokes.
+pub fn radial_grid_path(rect: Rect, rings: u32, spokes: u32) -> BezPath {
+    let mut p = BezPath::new();
+    for r in radial_rings(rect, rings) {
+        p.extend(kurbo::Ellipse::from_rect(r).path_elements(0.01));
+    }
+    for (a, b) in radial_spokes(rect, spokes) {
+        p.move_to(a);
+        p.line_to(b);
+    }
+    p
+}
+
+/// The most outlines one Outline Offset makes of an object.
+pub const OUTLINE_OFFSET_STEPS: u32 = 50;
+
 impl App {
     pub fn tools2_input(&mut self, response: &Response, p: Point, mods: Modifiers) {
         match self.tool {
@@ -278,6 +321,33 @@ impl App {
     }
 
     pub(crate) fn box_like_input(&mut self, response: &Response, p: Point, mods: Modifiers) {
+        // The Common Shapes tool drags the handles of the selected shape
+        // it drew, as the Shape tool does, so a shape is adjusted right
+        // after it is drawn (#4045).
+        if self.tool == Tool::CommonShapes {
+            if response.drag_started_by(PointerButton::Primary) {
+                if let Some((s, node @ crate::kind_nodes::KindNode::Adjust { .. })) =
+                    self.kind_node_at(p)
+                {
+                    self.drag = Drag::KindNode {
+                        shape: s.id,
+                        node,
+                        start: Box::new(s),
+                        single: false,
+                        chosen: [false; 4],
+                        begun: false,
+                        turn: 0.0,
+                    };
+                    return;
+                }
+            }
+            if matches!(self.drag, Drag::KindNode { .. }) {
+                if response.dragged_by(PointerButton::Primary) {
+                    self.kind_node_drag_step(p, mods);
+                }
+                return;
+            }
+        }
         let p = self.snap_point(p);
         if response.drag_started_by(PointerButton::Primary) {
             self.drag = Drag::Box {
@@ -325,11 +395,17 @@ impl App {
         from_center: bool,
     ) -> Option<BezPath> {
         use tracedraw_core::geometry::{ellipse_arc_path, ellipse_path, polygon_path};
+        if self.draws_arcs() {
+            return Some(self.arc_of_drag(start, current));
+        }
         let r = App::box_rect(start, current, from_center);
         let path = match self.tool {
             Tool::Rectangle => self.rect_corners.path(r, (1.0, 1.0)),
             Tool::Ellipse => match &self.ellipse_arc {
                 None => ellipse_path(r),
+                Some(a) if a.pie && a.inner > 0.0 => {
+                    tracedraw_core::geometry::ellipse_ring_path(r, a.start_deg, a.end_deg, a.inner)
+                }
                 Some(a) => ellipse_arc_path(r, a.start_deg, a.end_deg, a.pie),
             },
             Tool::Polygon => polygon_path(
@@ -357,7 +433,11 @@ impl App {
                 Some(mine) => mine.path(r),
                 None => self.common_shape.path(r),
             },
+            Tool::GraphPaper if self.graph_radial => {
+                radial_grid_path(r, self.graph_rings, self.graph_spokes)
+            }
             Tool::GraphPaper => grid_path(r, self.graph_rows, self.graph_cols),
+            Tool::ShapeGenerator => self.shape_gen_tool_preview(r),
             Tool::ActionLines => self.action_lines.path(r),
             Tool::Balloon => crate::balloons::Balloon::new(
                 r,
@@ -403,11 +483,19 @@ impl App {
                 if rect.width() > 0.1 && rect.height() > 0.1 {
                     // A shape of My shapes is filled when its outline was
                     // closed, as the objects it was made from.
-                    let (path, closed) = match self.picked_my_shape() {
+                    let mine = self.picked_my_shape();
+                    let (path, closed) = match &mine {
                         Some(mine) => (mine.path(rect), mine.closed),
                         None => (self.common_shape.path(rect), true),
                     };
-                    if let Some(id) = self.new_shape(ShapeKind::Path { path, closed }) {
+                    // A common shape keeps what it is and its settings, so
+                    // the Shape tool shows its handles (#4045).
+                    let params = mine.is_none().then(|| {
+                        let shape = self.common_shape;
+                        Box::new(crate::common_shapes::params(shape, rect, &shape.defaults()))
+                    });
+                    let kind = ShapeKind::Path { path, closed };
+                    if let Some(id) = self.new_shape_styled(kind, |s| s.common_shape = params) {
                         self.select(vec![id]);
                     }
                 }
@@ -471,52 +559,106 @@ impl App {
     /// open line gets the band round both of its sides; an inner offset
     /// larger than the object leaves nothing for it.
     pub fn outline_offset(&mut self, distance_mm: f64, outside: bool) {
+        self.outline_offset_with(
+            distance_mm,
+            outside,
+            tracedraw_core::shaping::Join::Miter,
+            1,
+        );
+    }
+
+    /// The curves Outline Offset makes of the selection: for each object
+    /// that gets any, the object and its outline offset `steps` times,
+    /// the first by `distance_mm`, the next by twice that and so on,
+    /// outside it or inside, the corners turned as `join` says (page
+    /// space). An open line gets the band round both of its sides; an
+    /// inner offset larger than the object leaves nothing for it.
+    pub fn outline_offset_paths(
+        &self,
+        distance_mm: f64,
+        outside: bool,
+        join: tracedraw_core::shaping::Join,
+        steps: u32,
+    ) -> Vec<(Shape, Vec<BezPath>)> {
         let d = distance_mm.abs();
         if !d.is_finite() || d < 1e-6 {
-            return;
+            return Vec::new();
         }
-        let Some(layer) = self.active_layer() else {
-            return;
-        };
-        let mut cmds = Vec::new();
-        let mut ids = Vec::new();
+        let mut out = Vec::new();
         for s in self.selected_shapes() {
             let base = s.transform * s.local_path();
             if base.elements().is_empty() {
                 continue;
             }
             let open = matches!(s.kind, ShapeKind::Path { closed: false, .. });
-            let join = tracedraw_core::shaping::Join::Miter;
-            let path = if open {
-                tracedraw_core::shaping::open_offset_band(&base, d, join)
-            } else {
-                let signed = if outside { d } else { -d };
-                tracedraw_core::shaping::offset_filled(&base, signed, join, s.fill_rule)
-            };
-            if path.elements().is_empty() {
-                continue;
+            let mut paths = Vec::new();
+            for k in 1..=steps.clamp(1, OUTLINE_OFFSET_STEPS) {
+                let dk = d * f64::from(k);
+                let path = if open {
+                    tracedraw_core::shaping::open_offset_band(&base, dk, join)
+                } else {
+                    let signed = if outside { dk } else { -dk };
+                    tracedraw_core::shaping::offset_filled(&base, signed, join, s.fill_rule)
+                };
+                if path.elements().is_empty() {
+                    // Further in there is nothing left either.
+                    break;
+                }
+                paths.push(path);
             }
-            let id = self.engine.new_shape_id();
-            let mut o = Shape::new(id, ShapeKind::Path { path, closed: true });
-            o.fill = s.fill.clone();
-            o.stroke = s.stroke.clone();
-            if matches!(o.fill, Fill::None) && o.stroke.is_none() {
-                o.stroke = Some(Stroke::new(tracedraw_core::Color::BLACK, Stroke::HAIRLINE));
+            if !paths.is_empty() {
+                out.push((s, paths));
             }
-            o.name = Some("Offset".into());
+        }
+        out
+    }
+
+    /// Outline Offset with every option of its dialog: the corners and
+    /// how many outlines, each `distance_mm` beyond the one before. The
+    /// new curves take the object's fill and outline and are selected;
+    /// those outside go behind their object, the farthest at the back,
+    /// and those inside in front, the innermost on top, so all show. One
+    /// undo step.
+    pub fn outline_offset_with(
+        &mut self,
+        distance_mm: f64,
+        outside: bool,
+        join: tracedraw_core::shaping::Join,
+        steps: u32,
+    ) {
+        let Some(layer) = self.active_layer() else {
+            return;
+        };
+        let mut cmds = Vec::new();
+        let mut ids = Vec::new();
+        for (s, paths) in self.outline_offset_paths(distance_mm, outside, join, steps) {
             let placed = self.doc().locate(s.id).ok();
-            cmds.push(Command::AddShape {
-                layer: placed.map(|(l, _)| l).unwrap_or(layer),
-                shape: o,
-            });
-            if placed.is_some() {
-                cmds.push(Command::OrderRelative {
-                    shapes: vec![id],
-                    reference: s.id,
-                    in_front: !outside,
+            // Each new curve goes right behind (outside) or right in
+            // front of (inside) the one before it.
+            let mut reference = s.id;
+            for path in paths {
+                let id = self.engine.new_shape_id();
+                let mut o = Shape::new(id, ShapeKind::Path { path, closed: true });
+                o.fill = s.fill.clone();
+                o.stroke = s.stroke.clone();
+                if matches!(o.fill, Fill::None) && o.stroke.is_none() {
+                    o.stroke = Some(Stroke::new(tracedraw_core::Color::BLACK, Stroke::HAIRLINE));
+                }
+                o.name = Some("Offset".into());
+                cmds.push(Command::AddShape {
+                    layer: placed.map(|(l, _)| l).unwrap_or(layer),
+                    shape: o,
                 });
+                if placed.is_some() {
+                    cmds.push(Command::OrderRelative {
+                        shapes: vec![id],
+                        reference,
+                        in_front: !outside,
+                    });
+                }
+                reference = id;
+                ids.push(id);
             }
-            ids.push(id);
         }
         if !cmds.is_empty() {
             let _ = self.engine.run_batch("Outline Offset", &cmds);
@@ -999,6 +1141,67 @@ mod tests {
         p.bounding_box()
     }
 
+    /// Graph Paper set to radial draws one group of rings, outermost at
+    /// the back and filling the box, and spokes from the middle to the
+    /// outer ring, the first pointing up; one undo takes it away.
+    #[test]
+    fn graph_paper_draws_a_radial_grid() {
+        use kurbo::ParamCurve as _;
+        let mut app = App::headless();
+        app.tool = Tool::GraphPaper;
+        app.graph_radial = true;
+        app.graph_rings = 3;
+        app.graph_spokes = 6;
+        app.create_box_shape(Point::new(20.0, 20.0), Point::new(80.0, 60.0));
+        let g = app.doc().shape(app.selection[0]).expect("grid").1.clone();
+        let ShapeKind::Group { children } = &g.kind else {
+            panic!("a group: {:?}", g.kind);
+        };
+        let rings: Vec<Rect> = children
+            .iter()
+            .filter_map(|c| match &c.kind {
+                ShapeKind::Ellipse { rect, .. } => Some(c.transform.transform_rect_bbox(*rect)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rings.len(), 3);
+        assert!((rings[0].width() - 60.0).abs() < 1e-9 && (rings[0].height() - 40.0).abs() < 1e-9);
+        assert!((rings[2].width() - 20.0).abs() < 1e-9, "{rings:?}");
+        let spokes: Vec<BezPath> = children
+            .iter()
+            .filter_map(|c| match &c.kind {
+                ShapeKind::Path {
+                    path,
+                    closed: false,
+                } => Some(c.transform * path.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(spokes.len(), 6);
+        let ends: Vec<Point> = spokes
+            .iter()
+            .filter_map(|p| p.segments().next().map(|s| s.end()))
+            .collect();
+        let top = ends[0];
+        assert!(
+            (top.x - 50.0).abs() < 1e-9 && (top.y - 20.0).abs().min((top.y - 60.0).abs()) < 1e-9,
+            "{top:?}"
+        );
+        assert!(spokes
+            .iter()
+            .all(|p| p.segments().next().map(|s| s.start()) == Some(Point::new(50.0, 40.0))));
+        // Cells again with the toggle off; one undo per grid.
+        app.undo();
+        assert!(app.doc().find_shape(g.id).is_none());
+        // The preview shows the rings and spokes.
+        let r = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let b = radial_grid_path(r, 2, 4).bounding_box();
+        assert!(
+            (b.x0 - r.x0).abs() + (b.y0 - r.y0).abs() + (b.x1 - r.x1).abs() + (b.y1 - r.y1).abs()
+                < 1e-9
+        );
+    }
+
     /// Convert Outline to Object on a dashed line keeps the dashes: each
     /// becomes a closed shape and the gaps stay empty (#490).
     #[test]
@@ -1041,6 +1244,120 @@ mod tests {
         let pp = out.page_path();
         assert!(!kurbo::Shape::contains(&pp, Point::new(15.0, 10.0)));
         assert!(kurbo::Shape::contains(&pp, Point::new(12.0, 10.0)));
+    }
+
+    /// A thick line's end goes under its arrowhead when it becomes an
+    /// object, as it is drawn: the head's tip stays a point. The whole
+    /// line was welded to the head, so its square end stood out past the
+    /// narrow tip (#3604).
+    #[test]
+    fn convert_outline_to_object_keeps_the_arrow_tip() {
+        let mut app = App::headless();
+        let mut line = BezPath::new();
+        line.move_to((10.0, 10.0));
+        line.line_to((110.0, 10.0));
+        let id = app
+            .new_shape(ShapeKind::Path {
+                path: line,
+                closed: false,
+            })
+            .expect("line");
+        let mut st = Stroke::new(tracedraw_core::Color::BLACK, 4.0);
+        st.end_arrow = tracedraw_core::style::Arrowhead::Arrow;
+        app.select(vec![id]);
+        app.run(Command::SetStroke {
+            shapes: vec![id],
+            stroke: Some(st.clone()),
+        });
+        let shape = app.doc().find_shape(id).cloned().expect("line");
+        let heads = tracedraw_core::style::arrowhead_paths(&shape.page_path(), &st);
+        let head = heads.first().expect("a head").clone();
+        let tip = kurbo::Shape::bounding_box(&head).x1;
+        // Just short of the tip, at the line's edge: outside the head.
+        let edge = Point::new(tip - 0.3, 10.0 + 1.8);
+        assert!(!kurbo::Shape::contains(&head, edge));
+        app.convert_outline_to_object();
+        let out = app
+            .doc()
+            .find_shape(app.selection[0])
+            .cloned()
+            .expect("object");
+        let pp = out.page_path();
+        assert!(!kurbo::Shape::contains(&pp, edge), "the line's end shows");
+        assert!(kurbo::Shape::contains(&pp, Point::new(tip - 0.3, 10.0)));
+        assert!(kurbo::Shape::contains(&pp, Point::new(40.0, 11.8)));
+    }
+
+    /// An open line's arrowheads come with its outline when it becomes an
+    /// object: the head beside the line is filled, as it was drawn
+    /// (#2983).
+    #[test]
+    fn convert_outline_to_object_keeps_the_arrowheads() {
+        let mut app = App::headless();
+        let mut line = BezPath::new();
+        line.move_to((10.0, 10.0));
+        line.line_to((70.0, 10.0));
+        let id = app
+            .new_shape(ShapeKind::Path {
+                path: line,
+                closed: false,
+            })
+            .expect("line");
+        let mut st = Stroke::new(tracedraw_core::Color::BLACK, 1.0);
+        st.end_arrow = tracedraw_core::style::Arrowhead::Arrow;
+        st.start_arrow = tracedraw_core::style::Arrowhead::Diamond;
+        app.select(vec![id]);
+        app.run(Command::SetStroke {
+            shapes: vec![id],
+            stroke: Some(st.clone()),
+        });
+        let shape = app.doc().find_shape(id).cloned().expect("line");
+        let heads = tracedraw_core::style::arrowhead_paths(&shape.page_path(), &st);
+        assert_eq!(heads.len(), 2);
+        // A point of each head away from the line's own band.
+        let beside: Vec<Point> = heads
+            .iter()
+            .map(|h| {
+                let b = kurbo::Shape::bounding_box(h);
+                (0..=40)
+                    .flat_map(|i| (0..=40).map(move |j| (i, j)))
+                    .map(|(i, j)| {
+                        Point::new(
+                            b.x0 + b.width() * i as f64 / 40.0,
+                            b.y0 + b.height() * j as f64 / 40.0,
+                        )
+                    })
+                    // Well inside the head, not on its edge.
+                    .find(|p| {
+                        (p.y - 10.0).abs() > 0.8
+                            && [
+                                (0.0, 0.0),
+                                (0.05, 0.05),
+                                (-0.05, -0.05),
+                                (0.05, -0.05),
+                                (-0.05, 0.05),
+                            ]
+                            .iter()
+                            .all(|(dx, dy)| {
+                                kurbo::Shape::contains(h, Point::new(p.x + dx, p.y + dy))
+                            })
+                    })
+                    .expect("a point of the head beside the line")
+            })
+            .collect();
+        app.convert_outline_to_object();
+        let out = app
+            .doc()
+            .find_shape(app.selection[0])
+            .cloned()
+            .expect("object");
+        let pp = out.page_path();
+        for p in beside {
+            assert!(kurbo::Shape::contains(&pp, p), "{p:?} filled");
+        }
+        // The line between the heads is still there, and nothing else.
+        assert!(kurbo::Shape::contains(&pp, Point::new(40.0, 10.0)));
+        assert!(!kurbo::Shape::contains(&pp, Point::new(40.0, 12.0)));
     }
 
     /// A combined curve of two crossing open lines (an "f": a stem and a
@@ -1890,6 +2207,30 @@ mod tests {
 /// when the object has no outline or it draws nothing.
 pub fn outline_object_path(s: &Shape) -> Option<BezPath> {
     let st = s.stroke.as_ref()?;
+    let line = outline_band_path(s, st)?;
+    // The arrowheads of an open line are part of what its outline draws,
+    // so they come with it, welded to it; they were left out and the
+    // object came out a plain band (#2983).
+    let heads = tracedraw_core::style::arrowhead_paths(&s.page_path(), st);
+    if heads.is_empty() {
+        return Some(line);
+    }
+    use tracedraw_core::shaping::{overlay, overlay_with, FillRule, Op};
+    let mut all = BezPath::new();
+    for h in &heads {
+        all.extend(h.elements().iter().copied());
+    }
+    let heads = overlay_with(&all, &BezPath::new(), Op::Weld, FillRule::NonZero);
+    let out = overlay(&line, &heads, Op::Weld);
+    Some(if out.elements().is_empty() {
+        line
+    } else {
+        with_closing_lines(&out)
+    })
+}
+
+/// [`outline_object_path`] of the line alone, without its arrowheads.
+fn outline_band_path(s: &Shape, st: &Stroke) -> Option<BezPath> {
     let width = if st.width <= Stroke::HAIRLINE + 1e-9 {
         0.25
     } else {
@@ -1914,6 +2255,10 @@ pub fn outline_object_path(s: &Shape) -> Option<BezPath> {
         // curves with as few nodes as keep its shape (#622).
         return Some(tracedraw_core::fit::fit_path(&band, OUTLINE_FIT_TOLERANCE));
     }
+    // The line is cut back under its arrowheads, as it is drawn (#2981):
+    // uncut, its square end stood out past the narrow tip of the head
+    // once the two were welded (#3604).
+    let pp = tracedraw_core::style::arrowhead_stroke_path(&pp, st).unwrap_or(pp);
     // A dashed outline: each dash becomes a closed shape of its
     // own, the gaps kept (#490). The pattern is in widths, as the
     // renderer draws it.

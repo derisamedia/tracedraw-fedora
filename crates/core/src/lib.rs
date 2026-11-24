@@ -31,20 +31,27 @@ pub mod jpeg_source;
 pub mod join;
 pub mod linked_text;
 pub mod live;
+pub mod live_paint;
 pub mod nodes;
 pub mod painterly;
 pub mod paragraphs;
+pub mod parallel;
 pub mod patch;
 pub mod picture_inks;
 mod press;
 pub mod procedural;
+pub mod rough;
 pub mod recolor;
+pub mod scale_grid;
 pub mod shadow;
 pub mod shaping;
 pub mod spreads;
 pub mod style;
+pub mod surface_map;
+pub mod symbols;
 pub mod table;
 pub mod text_flow;
+pub mod tiles;
 pub mod toc;
 
 pub use bytes::SharedBytes;
@@ -58,19 +65,20 @@ pub use document::{
     FollowBlack, FontVariation, Layer, LeadingUnit, LineStyle, MasterScope, Metadata, Numbering,
     ObjectDefaults, ObjectStyle, Page, ParagraphStyle, PathTextOrientation, PathTextVertical,
     QrCode, QrKind, Shadow, Shape, ShapeKind, StyleParts, Symbol, TabKind, TabStop, Table,
-    TableCell, TextAlign, TextDirection, TextOnPath, TextPosition, TextSpan, TimeTracker,
+    TableCell, TextAlign, TextDirection, Kashida, TextOnPath, CurvePreset, TextPosition, TextSpan, TimeTracker,
     TrackedTask, VerticalAlign, VerticalColumns, DEFAULT_TAB_STEP,
 };
+pub use document::{BulletPart, CommonShapeParams, MAX_LIST_LEVEL};
 pub use engine::Engine;
 pub use geometry::{Affine, BezPath, Point, Rect, Size, Vec2};
 pub use icc::{Intent as RenderingIntent, Profile as IccProfile, Transform as IccTransform};
 pub use id::{LayerId, PageId, ShapeId};
 pub use paragraphs::ParagraphFormat;
 pub use style::{
-    arrowhead_paths, Arrowhead, ArrowheadPlacement, ColorBlend, Fill, Fountain, FountainKind,
-    FountainRepeat, LineCap, LineJoin, Mesh, MeshHandle, MeshNode, OutlinePosition, Pattern,
-    PatternTile, Procedural, ProceduralParam, ProceduralParams, ProceduralPattern, Stop, Stroke,
-    Texture, TextureKind, WidthNode,
+    arrowhead_paths, arrowhead_stroke_path, Arrowhead, ArrowheadPlacement, ColorBlend, Fill,
+    Fountain, FountainKind, FountainRepeat, LineCap, LineJoin, Mesh, MeshHandle, MeshNode,
+    OutlinePosition, Pattern, PatternTile, Procedural, ProceduralParam, ProceduralParams,
+    ProceduralPattern, Stop, Stroke, Texture, TextureKind, WidthNode,
 };
 pub use table::{BorderSet, CellBorders, CellMargins, CellSide, EdgeBorder, TableHit};
 pub use text_flow::{TextWrap, WrapMode, WrapSide};
@@ -100,12 +108,16 @@ pub enum Error {
     SelectionGroup(u8),
     #[error("object {0:?} is not a clip frame")]
     NotClipFrame(ShapeId),
+    #[error("object {0:?} is not a group")]
+    NotGroup(ShapeId),
     #[error("object {0:?} is not a bitmap")]
     NotBitmap(ShapeId),
     #[error("object {0:?} is not a text")]
     NotText(ShapeId),
     #[error("a B-spline needs two finite control points or more")]
     BadSpline,
+    #[error("a shape needs a finite outline and settings on a curve")]
+    BadShape,
     #[error("symbol {0} not found")]
     SymbolNotFound(usize),
     #[error("symbol {0} cannot hold an instance of itself")]

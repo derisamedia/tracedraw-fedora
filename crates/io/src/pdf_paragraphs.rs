@@ -91,6 +91,16 @@ impl Line {
         self.spans.iter().map(|s| s.text.as_str()).collect()
     }
 
+    /// The line starts with a piece in another font than its own, a list
+    /// item's bullet (a symbol font's dot before the text): such a line
+    /// starts a list item, not the next line of the paragraph above. Run
+    /// on into it, the bullet came inside the text, and the text broke
+    /// over the next bullets (#3551).
+    fn leads_with_mark(&self) -> bool {
+        let first = self.spans.iter().find(|s| !s.text.trim().is_empty());
+        first.is_some_and(|f| f.font_family != self.main().font_family)
+    }
+
     /// How wide the first word may be, with the space before it: on the
     /// wide side (letters of 0.65 em), so that a line followed by a word
     /// that did not fit after it counts as full; a paragraph's last line
@@ -195,7 +205,7 @@ impl Block {
     /// `line` goes on this block, the next one down.
     fn takes(&mut self, line: &Line) -> bool {
         let last = self.last();
-        if !same_kind(self.first(), line) {
+        if !same_kind(self.first(), line) || line.leads_with_mark() {
             return false;
         }
         let em = self.first().em();
@@ -367,11 +377,17 @@ fn underlines_into_text(
             let (p, q) = (inv * a, inv * b);
             let (x0, x1) = (p.x.min(q.x), p.x.max(q.x));
             let y = (p.y + q.y) / 2.0;
-            // Along the text, just below its baseline, under some of it.
+            // Along the text, just below its baseline, under some of it
+            // and not reaching far past it: a longer line is a line of
+            // the drawing that passes under the text (a wire leaving a
+            // label, the edge of a box under a name), not its underline,
+            // and taking it away left a gap in the drawing (#4100).
             if (p.y - q.y).abs() > 0.05 * em
                 || !(-0.4 * em..=-0.02 * em).contains(&y)
                 || x1 < 0.0
                 || x0 > width
+                || x0 < -UNDERLINE_REACH_EM * em
+                || x1 > width + UNDERLINE_REACH_EM * em
                 || thick > 0.2 * em
             {
                 continue;
@@ -427,6 +443,10 @@ fn underlines_into_text(
         !gone[i - 1]
     });
 }
+
+/// How far past either end of a text (in ems) a line under it may reach
+/// and still be its underline.
+const UNDERLINE_REACH_EM: f64 = 0.5;
 
 /// The two ends and the thickness of a straight horizontal-ish bar the
 /// file drew: a stroked line of two points with no fill, or a thin filled
@@ -1148,6 +1168,27 @@ mod tests {
         assert!(spans.iter().any(|s| s.bold && s.text.trim() == "bold"));
     }
 
+    /// A list item's line, a bullet in a symbol font before the text,
+    /// starts an item of its own: it is not the next line of the item
+    /// above (#3551).
+    #[test]
+    fn a_bulleted_line_is_not_run_on() {
+        let (mut p, widths) = page(&[
+            ("First item text that goes on", 20.0, 250.0, 80.0),
+            ("l", 12.0, 245.0, 3.0),
+            ("Second item", 20.0, 245.0, 30.0),
+        ]);
+        if let ShapeKind::Text { spans, .. } = &mut p.shapes[1].kind {
+            spans[0].font_family = "Wingdings".into();
+        }
+        let mut pages = vec![p];
+        make_paragraphs(&mut pages, &widths, &HashMap::new());
+        let texts = texts(&pages[0]);
+        let first = "First item text that goes on".to_string();
+        assert!(texts.contains(&first), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("on l")), "{texts:?}");
+    }
+
     /// A line the file draws under two words becomes their underline,
     /// and goes (#2569).
     #[test]
@@ -1194,6 +1235,43 @@ mod tests {
             .map(|s| s.text.as_str())
             .collect();
         assert_eq!(under, "words underlined");
+    }
+
+    /// A line of the drawing that runs under a label and far past it (a
+    /// wire leaving a pin name in a circuit diagram) is not the label's
+    /// underline: it stays a line, and the label is not underlined
+    /// (#4100).
+    #[test]
+    fn a_long_line_passing_under_a_label_stays_a_line() {
+        let (mut p, mut widths) = page(&[("DOUT", 20.0, 250.0, 12.0)]);
+        let mut char_xs = HashMap::new();
+        char_xs.insert(ShapeId(1), vec![0.0, 3.0, 6.0, 9.0]);
+        let mut wire = Shape::new(
+            ShapeId(9),
+            ShapeKind::Path {
+                path: {
+                    let mut b = tracedraw_core::geometry::BezPath::new();
+                    b.move_to((18.0, 249.5));
+                    b.line_to((80.0, 249.5));
+                    b
+                },
+                closed: false,
+            },
+        );
+        wire.fill = Fill::None;
+        wire.stroke = Some(tracedraw_core::style::Stroke {
+            width: 0.2,
+            ..Default::default()
+        });
+        p.shapes.push(wire);
+        widths.insert(ShapeId(9), 0.0);
+        let mut pages = vec![p];
+        make_paragraphs(&mut pages, &widths, &char_xs);
+        assert_eq!(pages[0].shapes.len(), 2, "{:?}", texts(&pages[0]));
+        let ShapeKind::Text { spans, .. } = &pages[0].shapes[0].kind else {
+            panic!()
+        };
+        assert!(spans.iter().all(|s| s.underline == LineStyle::None));
     }
 
     /// A wide gap in a line is a tab, with a stop where the text after it

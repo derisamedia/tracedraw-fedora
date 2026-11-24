@@ -379,6 +379,11 @@ pub fn overlay_parts(subject: &BezPath, clip: &BezPath, op: Op) -> Vec<BezPath> 
 /// crossing of the two chords lies up to [`TOL`] off either curve.
 const ON_SOURCE: f64 = 1.5 * TOL;
 
+/// How far a stretch of a source may stray from an edge of the result, mm,
+/// and still be the curve that edge flattens: the flattening's error, and
+/// a little for the overlay's rounding.
+const FOLLOW: f64 = 1.25 * TOL;
+
 /// A place on a source outline: the subpath, and its segment index plus
 /// the parameter within the segment, one number that runs on across the
 /// segment ends (a closed subpath's wraps back to 0).
@@ -525,6 +530,8 @@ impl SourceSub {
 fn exact_crossing(subs: &[SourceSub], places: &[Place], p: Point) -> Option<Point> {
     use kurbo::{ParamCurveDeriv as _, PathSeg};
     let reach = 2.0 * ON_SOURCE;
+    // A node of an outline the vertex lies on, where outlines meet at it.
+    let mut node: Option<Point> = None;
     let mut inner: Vec<(PathSeg, f64)> = Vec::new();
     for q in places {
         let Some(sub) = subs.get(q.sub) else {
@@ -534,9 +541,10 @@ fn exact_crossing(subs: &[SourceSub], places: &[Place], p: Point) -> Option<Poin
             continue;
         };
         if (q.u - q.u.round()).abs() <= 1e-6 {
-            let node = sub.at(q.u, 0.0);
-            if (node - p).hypot() <= reach {
-                return Some(node);
+            let at = sub.at(q.u, 0.0);
+            if (at - p).hypot() <= reach && node.is_none_or(|n| (at - p).hypot() < (n - p).hypot())
+            {
+                node = Some(at);
             }
             continue;
         }
@@ -546,6 +554,8 @@ fn exact_crossing(subs: &[SourceSub], places: &[Place], p: Point) -> Option<Poin
         }
     }
     let mut best: Option<Point> = None;
+    // The nearest of them where the outlines cross at an angle.
+    let mut crossing: Option<Point> = None;
     for (n, (a, s0)) in inner.iter().enumerate() {
         for (b, t0) in inner.iter().skip(n + 1) {
             let (a, b) = (a.to_cubic(), b.to_cubic());
@@ -558,6 +568,13 @@ fn exact_crossing(subs: &[SourceSub], places: &[Place], p: Point) -> Option<Poin
                     let d = (q - p).hypot();
                     if d <= reach && best.is_none_or(|b| d < (b - p).hypot()) {
                         best = Some(q);
+                    }
+                    // Outlines that run along each other meet everywhere
+                    // there: no crossing to prefer to a node.
+                    let (ta, tb) = (da.eval(s).to_vec2(), db.eval(t).to_vec2());
+                    let sin = ta.cross(tb).abs() / (ta.hypot() * tb.hypot()).max(1e-300);
+                    if sin > 1e-3 && d <= reach && crossing.is_none_or(|b| d < (b - p).hypot()) {
+                        crossing = Some(q);
                     }
                     break;
                 }
@@ -572,7 +589,14 @@ fn exact_crossing(subs: &[SourceSub], places: &[Place], p: Point) -> Option<Poin
             }
         }
     }
-    best
+    // The node, unless the curves cross nearer to the vertex: a vertex
+    // beside a node, where another outline crosses the next segment a
+    // little way along it, lies on that crossing, not on the node (#1483).
+    match node {
+        Some(n) if crossing.is_some_and(|c| (c - p).hypot() < (n - p).hypot()) => crossing,
+        Some(n) => Some(n),
+        None => best,
+    }
 }
 
 /// A stretch of the result lying along one source subpath: where it
@@ -652,6 +676,21 @@ impl SegmentGrid {
         }
         &self.cells[cy * self.nx + cx]
     }
+}
+
+/// `path` with the curves of `sources` put back along it, as a combine
+/// does: the flattening of `path` where it follows a source outline
+/// becomes that stretch of the source, whole. A path made by several
+/// combines in turn (the Shape Builder's parts, cut by every object and
+/// then merged) keeps a node wherever an earlier one cut a curve, even
+/// where the cut is gone; laid back onto the objects it came from, each
+/// stretch along one of them is one piece again (#3587).
+pub fn onto_sources(path: &BezPath, sources: &[&BezPath]) -> BezPath {
+    let polygon = from_shapes(vec![contours(path)]);
+    if polygon.elements().is_empty() {
+        return path.clone();
+    }
+    recover_curves(&polygon, sources)
 }
 
 /// `result`, a polygon path made from the flattened `sources`, with the
@@ -736,6 +775,16 @@ fn recover_curves(result: &BezPath, sources: &[&BezPath]) -> BezPath {
                 for (s, i) in grid.near(q) {
                     subs[*s].place_on(*s, *i, q, &mut v);
                 }
+                // On the crossing, the vertex lies exactly on each outline:
+                // a place on one a little way off it (the node it is near,
+                // #1483) would pull the result away from it again.
+                let off = |pl: &Place| (subs[pl.sub].at(pl.u, 0.0) - q).hypot();
+                let exact: Vec<usize> = v
+                    .iter()
+                    .filter(|pl| off(pl) < 1e-7)
+                    .map(|pl| pl.sub)
+                    .collect();
+                v.retain(|pl| off(pl) < 1e-7 || !exact.contains(&pl.sub));
                 places[k] = v;
             }
         }
@@ -789,14 +838,30 @@ fn recover_curves(result: &BezPath, sources: &[&BezPath]) -> BezPath {
                     return None;
                 }
                 // The flattening put each edge within TOL of the curve; a
-                // chord across more of it lies farther from it.
+                // chord across more of it lies farther from it. The nodes
+                // the stretch passes are checked too: round a corner, a
+                // stretch can come back within a hair of the chord at the
+                // points sampled, as across the narrow gap between two
+                // stems of condensed text (#1483).
                 let chord = kurbo::Line::new(prev, p);
-                for f in [0.25, 0.5, 0.75] {
+                let off = |q: Point| {
                     use kurbo::ParamCurveNearest as _;
-                    let q = sub.at(ua, du * f);
-                    if chord.nearest(q, 1e-9).distance_sq > (2.0 * TOL) * (2.0 * TOL) {
+                    chord.nearest(q, 1e-9).distance_sq > FOLLOW * FOLLOW
+                };
+                if [0.25, 0.5, 0.75].iter().any(|f| off(sub.at(ua, du * f))) {
+                    return None;
+                }
+                let (lo, hi) = if du > 0.0 {
+                    (ua, ua + du)
+                } else {
+                    (ua + du, ua)
+                };
+                let mut node = lo.floor() + 1.0;
+                while node < hi - 1e-6 {
+                    if off(sub.at(node, 0.0)) {
                         return None;
                     }
+                    node += 1.0;
                 }
                 Some(du)
             };
@@ -1128,6 +1193,127 @@ fn enclosed_area_within(paths: &[BezPath], sources: &[BezPath], p: Point) -> Enc
     Enclosed::OnOutline
 }
 
+/// How a live Combine joins the objects of a group (see
+/// [`combine_areas`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CombineMode {
+    /// Everything any object covers.
+    #[default]
+    Weld,
+    /// The bottom object with the others cut out of it.
+    BackMinusFront,
+    /// Only where all the objects overlap.
+    Intersect,
+    /// Where an odd number of objects overlap: overlaps of two cut out.
+    Exclude,
+}
+
+impl CombineMode {
+    pub const ALL: [CombineMode; 4] = [
+        CombineMode::Weld,
+        CombineMode::BackMinusFront,
+        CombineMode::Intersect,
+        CombineMode::Exclude,
+    ];
+}
+
+/// The `areas` (bottom first, each read with the even-odd rule) combined
+/// as `mode` says, as one clean outline.
+pub fn combine_areas(areas: &[BezPath], mode: CombineMode) -> BezPath {
+    let empty = BezPath::new();
+    let mut it = areas.iter().filter(|a| !a.elements().is_empty());
+    let Some(first) = it.next() else {
+        return BezPath::new();
+    };
+    let start = overlay(first, &empty, Op::Weld);
+    it.fold(start, |acc, a| {
+        let op = match mode {
+            CombineMode::Weld => Op::Weld,
+            CombineMode::BackMinusFront => Op::Trim,
+            CombineMode::Intersect => Op::Intersect,
+            CombineMode::Exclude => Op::Exclude,
+        };
+        overlay(&acc, a, op)
+    })
+}
+
+/// Pieces smaller than this (square units) are dropped as slivers.
+const PIECE_MIN_AREA: f64 = 1e-4;
+
+/// The pieces the `areas` (bottom first, each read with the even-odd
+/// rule) cut each other into, each one connected piece of the plane
+/// with the index of the top area that covers it: where a top area lies
+/// over lower ones, the edges of the lower ones still cut it into
+/// pieces. Break into Pieces makes an object of each.
+pub fn divide_pieces(areas: &[BezPath]) -> Vec<(BezPath, usize)> {
+    use kurbo::Shape as _;
+    let empty = BezPath::new();
+    let mut faces: Vec<(BezPath, usize)> = Vec::new();
+    for (i, a) in areas.iter().enumerate() {
+        let a = overlay(a, &empty, Op::Weld);
+        if a.elements().is_empty() {
+            continue;
+        }
+        let ab = a.bounding_box();
+        let mut next = Vec::with_capacity(faces.len() * 2 + 1);
+        let mut rest = a.clone();
+        for (f, k) in faces {
+            if f.bounding_box().intersect(ab).area() <= 0.0 {
+                next.push((f, k));
+                continue;
+            }
+            let inside = overlay(&f, &a, Op::Intersect);
+            let outside = overlay(&f, &a, Op::Trim);
+            rest = overlay(&rest, &f, Op::Trim);
+            if !inside.elements().is_empty() {
+                next.push((inside, i));
+            }
+            if !outside.elements().is_empty() {
+                next.push((outside, k));
+            }
+        }
+        if !rest.elements().is_empty() {
+            next.push((rest, i));
+        }
+        faces = next;
+    }
+    faces
+        .into_iter()
+        .flat_map(|(f, k)| {
+            overlay_parts(&f, &empty, Op::Weld)
+                .into_iter()
+                .map(move |p| (p, k))
+        })
+        .filter(|(p, _)| filled_area(p, FillRule::EvenOdd) > PIECE_MIN_AREA)
+        .collect()
+}
+
+/// What shows of each of the `areas` (bottom first, even-odd): each with
+/// the areas above it cut out; an area covered entirely is empty.
+pub fn visible_parts(areas: &[BezPath]) -> Vec<BezPath> {
+    use kurbo::Shape as _;
+    let empty = BezPath::new();
+    let mut out = Vec::with_capacity(areas.len());
+    for (i, a) in areas.iter().enumerate() {
+        let mut part = overlay(a, &empty, Op::Weld);
+        for above in &areas[i + 1..] {
+            if part.elements().is_empty() {
+                break;
+            }
+            if part.bounding_box().intersect(above.bounding_box()).area() <= 0.0 {
+                continue;
+            }
+            part = overlay(&part, above, Op::Trim);
+        }
+        if filled_area(&part, FillRule::EvenOdd) <= PIECE_MIN_AREA {
+            part = BezPath::new();
+        }
+        out.push(part);
+    }
+    out
+}
+
 /// How an offset outline turns its corners.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1167,6 +1353,47 @@ pub fn offset_filled(path: &BezPath, d: f64, join: Join, fill: FillRule) -> BezP
     }
     fit_polygon_curves(&offset_polygon_with(path, d, join, fill), fit_tolerance(d))
 }
+
+/// The area `path` fills read with `fill`, as straight-sided contours
+/// with the outer ones turning one way and the holes the other (no
+/// contour crossing another): several such areas put in one path fill
+/// their union under the nonzero rule.
+pub fn oriented_area(path: &BezPath, fill: FillRule) -> BezPath {
+    use i_overlay::float::simplify::SimplifyShape;
+    let clean = contours(path).simplify_shape(match fill {
+        FillRule::EvenOdd => IFill::EvenOdd,
+        FillRule::NonZero => IFill::NonZero,
+    });
+    from_shapes(clean)
+}
+
+/// Offset Path: `path` (its area read with `fill`) moved out by `d` mm
+/// (in when negative), its corners turned as `join` says, then smoothed
+/// by `smooth` mm: grown and shrunk back by that much with round corners,
+/// which rounds every hollow (where two parts meet) and leaves the rest
+/// as it was. With both zero, the area as one clean outline. The result
+/// fills alike with either rule.
+pub fn offset_smooth(path: &BezPath, d: f64, smooth: f64, join: Join, fill: FillRule) -> BezPath {
+    if !(d.is_finite() && smooth.is_finite()) {
+        return path.clone();
+    }
+    let d = d.clamp(-MAX_OFFSET, MAX_OFFSET);
+    let smooth = smooth.clamp(0.0, MAX_OFFSET);
+    let mut poly = if d.abs() > 1e-9 {
+        offset_polygon_with(path, d, join, fill)
+    } else {
+        oriented_area(path, fill)
+    };
+    if smooth > 1e-9 && !poly.elements().is_empty() {
+        poly = offset_polygon_with(&poly, smooth, Join::Round, FillRule::NonZero);
+        poly = offset_polygon_with(&poly, -smooth, Join::Round, FillRule::NonZero);
+    }
+    let tol = fit_tolerance(d.abs().max(smooth));
+    fit_polygon_curves(&poly, tol)
+}
+
+/// The largest Offset Path distance or smoothing, mm.
+pub const MAX_OFFSET: f64 = 1000.0;
 
 /// The area `path` fills read with `fill`, in square units of its
 /// coordinates: holes taken out, overlaps counted once. The curves are
@@ -2693,6 +2920,115 @@ pub fn stroke_area(path: &BezPath, stroke: &crate::style::Stroke) -> BezPath {
     kurbo::stroke(path.iter(), &style, &kurbo::StrokeOpts::default(), tol)
 }
 
+/// An outline whose gradient runs along the line (see
+/// [`Stroke::fill_along`](crate::style::Stroke::fill_along)), as short
+/// pieces of its area from start to end, each with the gradient's colour
+/// and opacity at its middle; the outline is `width` wide (page units).
+/// `None` unless the outline has a gradient of its own to run along it.
+/// Dashes are left out: the pieces cover the whole line.
+pub fn along_slices(
+    path: &BezPath,
+    stroke: &crate::style::Stroke,
+    width: f64,
+) -> Option<Vec<(BezPath, crate::color::Color, f32)>> {
+    let crate::style::Fill::Fountain(f) = stroke.fill.as_deref()? else {
+        return None;
+    };
+    // A calligraphic or variable outline keeps its own band.
+    let band = !stroke.widths.is_empty() || stroke.stretch < 0.999;
+    if !stroke.fill_along || band || !(width.is_finite() && width > 0.0) {
+        return None;
+    }
+    // The line as polylines, one per subpath.
+    let tol = (width / 50.0).clamp(1e-3, 0.05);
+    let mut lines: Vec<Vec<Point>> = Vec::new();
+    kurbo::flatten(path.iter(), tol, |el| match el {
+        PathEl::MoveTo(p) => lines.push(vec![p]),
+        PathEl::LineTo(p) => {
+            if let Some(l) = lines.last_mut() {
+                l.push(p);
+            }
+        }
+        PathEl::ClosePath => {
+            if let Some(l) = lines.last_mut() {
+                if let Some(&first) = l.first() {
+                    l.push(first);
+                }
+            }
+        }
+        _ => {}
+    });
+    let length = |l: &[Point]| l.windows(2).map(|w| (w[1] - w[0]).hypot()).sum::<f64>();
+    let total: f64 = lines.iter().map(|l| length(l)).sum();
+    if total.is_nan() || total <= 1e-9 {
+        return None;
+    }
+    let n = ((total / (width * 0.5).max(0.25)).ceil() as usize).clamp(8, 400);
+    let step = total / n as f64;
+    // Neighbouring pieces overlap a little, so no seam shows between them.
+    let overlap = (step * 0.1).min(0.02);
+    let blended = f.blended_stops();
+    let mut piece_stroke = stroke.clone();
+    piece_stroke.width = width;
+    piece_stroke.dash.clear();
+    piece_stroke.fill = None;
+    piece_stroke.fill_along = false;
+    let mut out = Vec::new();
+    let mut done = 0.0;
+    for line in &lines {
+        let len = length(line);
+        if len <= 1e-9 {
+            continue;
+        }
+        // Cumulative lengths of the polyline's points.
+        let mut at = vec![0.0];
+        for w in line.windows(2) {
+            let last = *at.last().unwrap_or(&0.0);
+            at.push(last + (w[1] - w[0]).hypot());
+        }
+        let point = |d: f64| -> Point {
+            let d = d.clamp(0.0, len);
+            let i = at.partition_point(|&a| a < d).clamp(1, line.len() - 1);
+            let span = at[i] - at[i - 1];
+            let u = if span > 1e-12 {
+                (d - at[i - 1]) / span
+            } else {
+                0.0
+            };
+            line[i - 1].lerp(line[i], u)
+        };
+        let closed = line.len() > 2 && line.first() == line.last();
+        let pieces = (len / step).ceil().max(1.0) as usize;
+        let size = len / pieces as f64;
+        for k in 0..pieces {
+            let a = k as f64 * size;
+            let b = ((k + 1) as f64 * size + overlap).min(len);
+            let mut piece = BezPath::new();
+            piece.move_to(point(a));
+            for (i, &d) in at.iter().enumerate() {
+                if d > a && d < b {
+                    piece.line_to(line[i]);
+                }
+            }
+            piece.line_to(point(b));
+            // Only an open line's own ends keep its caps.
+            let mut st = piece_stroke.clone();
+            if closed || (k > 0 && k + 1 < pieces) {
+                st.cap = crate::style::LineCap::Butt;
+            }
+            let area = stroke_area(&piece, &st);
+            if area.elements().is_empty() {
+                continue;
+            }
+            let t = (done + (a + b) / 2.0) / total;
+            let stop = f.sample_blended(&blended, t);
+            out.push((area, stop.color, stop.opacity));
+        }
+        done += len;
+    }
+    Some(out)
+}
+
 /// Corners sharper than this (degrees between the tangents) split a path
 /// into runs for dash alignment; smooth nodes do not.
 const DASH_CORNER_DEG: f64 = 3.0;
@@ -3017,8 +3353,156 @@ pub fn nonzero_as_even_odd(path: &BezPath) -> BezPath {
     out
 }
 
+/// The subpaths of a curve put together as islands: each closed part
+/// that lies inside an odd number of others is a hole and joins the
+/// smallest part around it, so a letter keeps its counter; parts inside
+/// a hole are islands again. Open parts stay on their own. The order of
+/// the islands follows their outer parts (#3700).
+pub fn islands_with_holes(parts: Vec<BezPath>) -> Vec<BezPath> {
+    use kurbo::Shape as _;
+    let closed: Vec<bool> = parts
+        .iter()
+        .map(|p| p.elements().last() == Some(&PathEl::ClosePath))
+        .collect();
+    let areas: Vec<f64> = parts.iter().map(|p| p.area().abs()).collect();
+    // A point of each part: the middle of its first segment, which lies
+    // on it and away from the others when the parts do not touch.
+    let probe: Vec<Option<Point>> = parts
+        .iter()
+        .map(|p| p.segments().next().map(|seg| seg.eval(0.5)))
+        .collect();
+    let n = parts.len();
+    // The parts around each part, the smallest first.
+    let around: Vec<Vec<usize>> = (0..n)
+        .map(|i| {
+            let Some(pt) = probe[i] else {
+                return Vec::new();
+            };
+            let mut outer: Vec<usize> = (0..n)
+                .filter(|&j| j != i && closed[j] && areas[j] > areas[i] && parts[j].winding(pt) != 0)
+                .collect();
+            outer.sort_by(|a, b| areas[*a].partial_cmp(&areas[*b]).unwrap_or(std::cmp::Ordering::Equal));
+            outer
+        })
+        .collect();
+    let hole = |i: usize| closed[i] && around[i].len() % 2 == 1;
+    let mut owner: Vec<usize> = (0..n).collect();
+    for i in 0..n {
+        if hole(i) {
+            if let Some(&j) = around[i].first() {
+                owner[i] = j;
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for i in 0..n {
+        if owner[i] != i {
+            continue;
+        }
+        let mut path = parts[i].clone();
+        for (k, part) in parts.iter().enumerate() {
+            if k != i && owner[k] == i {
+                path.extend(part.elements().iter().copied());
+            }
+        }
+        out.push(path);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    /// Islands with holes: the O of a word keeps its counter, a dot
+    /// inside the counter is an island of its own, and a part beside
+    /// stays alone (#3700).
+    #[test]
+    fn islands_keep_their_holes() {
+        use super::{BezPath, PathEl};
+        let sq = |x0: f64, y0: f64, x1: f64, y1: f64| {
+            let mut p = BezPath::new();
+            p.move_to((x0, y0));
+            p.line_to((x1, y0));
+            p.line_to((x1, y1));
+            p.line_to((x0, y1));
+            p.close_path();
+            p
+        };
+        let parts = vec![
+            sq(0.0, 0.0, 10.0, 10.0),
+            sq(2.0, 2.0, 8.0, 8.0),
+            sq(4.0, 4.0, 6.0, 6.0),
+            sq(20.0, 0.0, 30.0, 10.0),
+        ];
+        let out = super::islands_with_holes(parts);
+        assert_eq!(out.len(), 3);
+        let subpaths = |p: &BezPath| {
+            p.elements()
+                .iter()
+                .filter(|e| matches!(e, PathEl::MoveTo(_)))
+                .count()
+        };
+        assert_eq!(subpaths(&out[0]), 2, "the O and its counter");
+        assert_eq!(subpaths(&out[1]), 1, "the dot inside the counter");
+        assert_eq!(subpaths(&out[2]), 1, "the part beside");
+    }
+
+    #[test]
+    fn a_gradient_along_the_line_colours_it_from_start_to_end() {
+        use crate::color::Color;
+        use crate::style::{Fill, Fountain, FountainKind, Stroke};
+        let mut line = super::BezPath::new();
+        line.move_to((0.0, 0.0));
+        line.line_to((100.0, 0.0));
+        let mut st = Stroke::new(Color::BLACK, 4.0);
+        st.fill = Some(Box::new(Fill::Fountain(Fountain::two(
+            FountainKind::Linear,
+            Color::rgb8(255, 0, 0),
+            Color::rgb8(0, 0, 255),
+            90.0,
+        ))));
+        // Off: no pieces, the gradient lies across the drawing as before.
+        assert!(super::along_slices(&line, &st, 4.0).is_none());
+        st.fill_along = true;
+        let pieces = super::along_slices(&line, &st, 4.0).expect("pieces");
+        assert!(pieces.len() >= 8);
+        let (first, c0, _) = &pieces[0];
+        let (last, c1, _) = pieces.last().expect("last");
+        use kurbo::Shape as _;
+        assert!(first.bounding_box().x0 < 1.0 && last.bounding_box().x1 > 99.0);
+        // Red at the start, blue at the end, whatever the gradient's angle.
+        let [r0, _, b0] = c0.to_rgb8();
+        let [r1, _, b1] = c1.to_rgb8();
+        assert!(r0 > 200 && b0 < 50, "{c0:?}");
+        assert!(b1 > 200 && r1 < 50, "{c1:?}");
+        // The pieces cover the line's width.
+        assert!((first.bounding_box().height() - 4.0).abs() < 1e-6);
+    }
+
+    /// Two overlapping squares cut into three pieces, the overlap taking
+    /// the top one; what shows of each; and the live combine modes.
+    #[test]
+    fn overlapping_squares_divide_into_pieces_and_combine() {
+        use kurbo::Shape as _;
+        let sq = |x: f64| kurbo::Rect::new(x, 0.0, x + 10.0, 10.0).to_path(0.01);
+        let areas = [sq(0.0), sq(5.0)];
+        let pieces = divide_pieces(&areas);
+        assert_eq!(pieces.len(), 3, "{pieces:?}");
+        let mut by: Vec<(usize, i64)> = pieces
+            .iter()
+            .map(|(p, k)| (*k, filled_area(p, FillRule::EvenOdd).round() as i64))
+            .collect();
+        by.sort();
+        assert_eq!(by, vec![(0, 50), (1, 50), (1, 50)]);
+        let shown = visible_parts(&areas);
+        assert_eq!(filled_area(&shown[0], FillRule::EvenOdd).round(), 50.0);
+        assert_eq!(filled_area(&shown[1], FillRule::EvenOdd).round(), 100.0);
+        let area = |m| filled_area(&combine_areas(&areas, m), FillRule::EvenOdd).round();
+        assert_eq!(area(CombineMode::Weld), 150.0);
+        assert_eq!(area(CombineMode::BackMinusFront), 50.0);
+        assert_eq!(area(CombineMode::Intersect), 50.0);
+        assert_eq!(area(CombineMode::Exclude), 100.0);
+    }
+
 
     /// A shaky stroke of the round eraser across a circle (#2831): the
     /// smoothed band leaves straight, smooth edges with few nodes, where

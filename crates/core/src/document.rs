@@ -160,6 +160,10 @@ pub mod text_outline {
         pub text: String,
         /// The span it belongs to.
         pub span: usize,
+        /// The number of the first character it stands for among the
+        /// characters of the whole text (in the order they are typed;
+        /// glyphs come in the order they are drawn, left to right).
+        pub char_idx: usize,
         /// Its outline as drawn, layout space (mm).
         pub path: BezPath,
         /// False when the drawn outline is not the font's own glyph
@@ -187,6 +191,41 @@ pub mod text_outline {
     /// The glyphs of a text object, when a text engine is registered.
     pub fn glyphs(req: &TextRequest) -> Option<GlyphLayout> {
         GLYPHER.get().map(|f| f(req))
+    }
+
+    /// Result of resolving a run of raw glyph indices (`ETO_GLYPH_INDEX` in
+    /// Windows metafiles) against the font face they were shaped for:
+    /// decoded Unicode text when every glyph maps back through `cmap`, else
+    /// the placed glyph outlines in local millimetres (baseline at y = 0,
+    /// y up).
+    #[derive(Clone, Debug)]
+    pub enum ResolvedGlyphRun {
+        Text(String),
+        Path(BezPath),
+    }
+
+    /// Request to resolve a run of raw glyph indices (`ETO_GLYPH_INDEX`).
+    #[derive(Clone, Copy, Debug)]
+    pub struct GlyphRunRequest<'a> {
+        pub family: &'a str,
+        pub bold: bool,
+        pub italic: bool,
+        pub em_mm: f64,
+        pub gids: &'a [u16],
+        pub advances_mm: &'a [f64],
+    }
+
+    type GlyphRunResolver = fn(&GlyphRunRequest<'_>) -> Option<ResolvedGlyphRun>;
+    static GLYPH_RUN_RESOLVER: OnceLock<GlyphRunResolver> = OnceLock::new();
+
+    /// Register the font database's glyph-index resolver.
+    pub fn set_glyph_indices(f: GlyphRunResolver) {
+        let _ = GLYPH_RUN_RESOLVER.set(f);
+    }
+
+    /// Resolve `req.gids` against `(req.family, req.bold, req.italic)`.
+    pub fn resolve_glyph_indices(req: &GlyphRunRequest<'_>) -> Option<ResolvedGlyphRun> {
+        GLYPH_RUN_RESOLVER.get().and_then(|f| f(req))
     }
 }
 
@@ -1073,6 +1112,14 @@ pub fn axis_scale(t: Affine) -> (f64, f64) {
     (a.hypot(b), c.hypot(d))
 }
 
+/// True when `t` has no turn or skew (moves, scales and mirrors only):
+/// it maps an axis-aligned box onto the exact axis-aligned box of what
+/// it transforms, so the box can be mapped instead of the outline.
+fn axis_aligned(t: Affine) -> bool {
+    let [_, b, c, _, _, _] = t.as_coeffs();
+    b == 0.0 && c == 0.0
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ShapeKind {
@@ -1097,7 +1144,10 @@ pub enum ShapeKind {
     /// counter-clockwise): a twisted star. `sharpness` 0 is a polygon,
     /// 0 to 1 a star whose inner points come in toward the centre, 0 to
     /// -1 an inverted star whose inner points lie past it
-    /// (`geometry::star_inner_ratio`).
+    /// (`geometry::star_inner_ratio`). `bend` curves every side the same
+    /// way, so the shape keeps its symmetry: each side bows out to its
+    /// left (outward on a polygon) by `bend` times its length, inward
+    /// when negative (`geometry::bent_polygon_path`, #2451).
     Polygon {
         rect: Rect,
         points: u32,
@@ -1106,6 +1156,8 @@ pub enum ShapeKind {
         complex: Option<u32>,
         #[serde(default, skip_serializing_if = "is_zero")]
         twist: f64,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        bend: f64,
     },
     /// Free path (lines and cubic Beziers) in local space.
     Path { path: BezPath, closed: bool },
@@ -1189,6 +1241,27 @@ impl ShapeKind {
         }
     }
 
+    /// The box this kind knows without an outline: a rectangle whose
+    /// edges are not bowed (its corners stay inside the rect, a bulged
+    /// edge reaches past it, #2188), a whole ellipse (an arc or pie
+    /// covers part of it), a bitmap, a table and a symbol instance's
+    /// placeholder box (what `local_path` draws for one). `None` for
+    /// the kinds whose box the outline gives.
+    fn known_box(&self) -> Option<Rect> {
+        match self {
+            ShapeKind::Rect { rect, corners, .. }
+                if corners.as_ref().is_none_or(|c| !c.has_bulge()) =>
+            {
+                Some(*rect)
+            }
+            ShapeKind::Ellipse { rect, arc: None } => Some(*rect),
+            ShapeKind::Bitmap { rect, .. } => Some(*rect),
+            ShapeKind::Table(t) => Some(t.rect),
+            ShapeKind::SymbolInstance { .. } => Some(Rect::new(0.0, 0.0, 10.0, 10.0)),
+            _ => None,
+        }
+    }
+
     /// A rectangle with these corners. Plain ones (one round radius that
     /// scales with the object) keep the short form; otherwise `radius`
     /// holds the largest corner for readers that know only one.
@@ -1248,6 +1321,10 @@ pub struct EllipseArc {
     pub end_deg: f64,
     /// Pie (wedge closed through the centre) or open arc.
     pub pie: bool,
+    /// A pie's thickness as a ring: the inner edge at this share of the
+    /// radii, 0 to 0.99 (0 a plain pie, through the centre).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub inner: f64,
 }
 
 /// Drop shadow attached to an object (the Drop Shadow tool).
@@ -1991,6 +2068,13 @@ pub struct ParagraphStyle {
     pub hyphenate: bool,
     /// Fit text to frame: scale the font so the text fills the frame height.
     pub fit_to_frame: bool,
+    /// Type block (paragraph text): the words are shared out between the
+    /// lines and each line takes a size of its own so that it fills the
+    /// frame's width exactly, the lines together filling its height as
+    /// nearly as they can; laid out anew whenever the frame changes. Each
+    /// word keeps its own font.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub type_block: bool,
     /// Align baselines to a grid of this pitch in mm (Text > Align to
     /// Baseline Grid); 0 = off. Only paragraph text snaps. The grid is the
     /// page's (from its top and the grid's start offset) for a frame that
@@ -2020,6 +2104,11 @@ pub struct ParagraphStyle {
     /// the first line's indent going to the right. Not in older files.
     #[serde(default, skip_serializing_if = "TextDirection::is_left_to_right")]
     pub direction: TextDirection,
+    /// How much of a justified line's room Arabic-script words take by
+    /// stretching their joins (kashida, #3827) instead of the spaces
+    /// between them. Off by default; not in older files.
+    #[serde(default, skip_serializing_if = "Kashida::is_off")]
+    pub kashida: Kashida,
     /// The paragraph frame's background; `None` = transparent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_fill: Option<Fill>,
@@ -2028,6 +2117,42 @@ pub struct ParagraphStyle {
     /// [`crate::text_flow`]); not saved.
     #[serde(skip)]
     pub flow: crate::text_flow::FrameFlow,
+    /// The closed shape this frame's text was put into (Text > Text
+    /// Frame > Put Text Inside Shape): its lines stay inside that
+    /// shape's outline, wherever the two stand. `None`, or a shape that
+    /// is gone: the plain rectangular frame. Not in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inside: Option<ShapeId>,
+    /// Which bullets this text draws when it is one part of a text drawn
+    /// in parts ([`Shape::text_parts`], #3682); `None` (a whole text):
+    /// every bullet, in its paragraph's first letter's look. Set only on
+    /// the parts, never in a drawing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bullet_part: Option<BulletPart>,
+}
+
+/// The bullets a part of a text drawn in parts draws (#3682).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum BulletPart {
+    /// The characters' part: bullets without a colour of their own, with
+    /// the paragraph's first letter.
+    Text,
+    /// Only the bullets of this colour of their own, no characters.
+    Color(crate::Color),
+}
+
+impl BulletPart {
+    /// Whether a bullet of `own` colour (`None`: none of its own) whose
+    /// paragraph's first letter is drawn (`letter_drawn`) is drawn in
+    /// this part (`None`: a whole text).
+    pub fn draws(part: Option<BulletPart>, own: Option<crate::Color>, letter_drawn: bool) -> bool {
+        match (part, own) {
+            (None, _) | (Some(BulletPart::Text), None) => letter_drawn,
+            (Some(BulletPart::Text), Some(_)) => false,
+            (Some(BulletPart::Color(c)), Some(o)) => c == o,
+            (Some(BulletPart::Color(_)), None) => false,
+        }
+    }
 }
 
 /// The distance between the default tab stops of a paragraph with no
@@ -2187,6 +2312,14 @@ impl LeadingUnit {
 }
 
 impl ParagraphStyle {
+    /// The room kept between the outline of the shape the text was put
+    /// into ([`ParagraphStyle::inside`]) and its lines, mm.
+    pub fn inside_inset(&self) -> f64 {
+        1.0
+    }
+}
+
+impl ParagraphStyle {
     /// The distance from one baseline to the next, mm, for a line whose
     /// font has `line_height_mm` from ascent to descent plus gap at a size
     /// of `size_mm`.
@@ -2261,6 +2394,42 @@ impl TextDirection {
     }
 }
 
+/// How a justified paragraph in Arabic script fills its lines (see
+/// [`ParagraphStyle::kashida`], #3827): only by widening the spaces
+/// between words (`Off`), or also by stretching the joins between
+/// connected letters (kashida), a little (`Low`), more (`Medium`) or as
+/// far as the line needs (`High`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kashida {
+    #[default]
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+impl Kashida {
+    /// Every setting, in the order a list shows them.
+    pub const ALL: [Kashida; 4] = [Kashida::Off, Kashida::Low, Kashida::Medium, Kashida::High];
+
+    pub fn is_off(&self) -> bool {
+        *self == Kashida::Off
+    }
+
+    /// The share of a line's room the stretched joins take (the rest
+    /// widens the spaces), and the most one join is stretched by, in ems
+    /// of the font size.
+    pub fn share_and_cap(self) -> (f64, f64) {
+        match self {
+            Kashida::Off => (0.0, 0.0),
+            Kashida::Low => (0.35, 0.5),
+            Kashida::Medium => (0.7, 1.0),
+            Kashida::High => (1.0, 2.5),
+        }
+    }
+}
+
 /// Where paragraph text sits in its frame (the Text docker's Frame
 /// section): at the top, in the middle or at the bottom of the room its
 /// lines leave. Text that overflows the frame starts at the top.
@@ -2300,13 +2469,17 @@ impl Default for ParagraphStyle {
             tabs: Vec::new(),
             hyphenate: false,
             fit_to_frame: false,
+            type_block: false,
             baseline_grid_mm: 0.0,
             vertical_align: VerticalAlign::Top,
             vertical: false,
             vertical_columns: VerticalColumns::RightToLeft,
             direction: TextDirection::LeftToRight,
+            kashida: Kashida::Off,
             frame_fill: None,
+            bullet_part: None,
             flow: crate::text_flow::FrameFlow::default(),
+            inside: None,
         }
     }
 }
@@ -2483,7 +2656,40 @@ pub struct BulletStyle {
     /// the bullet standing out on its own. On: they go back to the left
     /// indent, under the bullet.
     pub no_hanging: bool,
+    /// The bullet's or number's own colour; `None` = the colour of the
+    /// paragraph's first letter (#3682).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<crate::Color>,
+    /// The bullet's or number's own bold and italic; `None` = as the
+    /// paragraph's first letter (#3682).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bold: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub italic: Option<bool>,
+    /// The list level, 0 for the top: each level is set in by
+    /// `level_indent` and numbers on its own, starting again under each
+    /// paragraph of the level above (#3685).
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub level: u32,
+    /// How far each list level is set in, mm (#3685).
+    pub level_indent: f64,
+    /// This paragraph's number starts again at `start`, though the
+    /// paragraph before it is numbered on the same level (#3685).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub restart: bool,
+    /// After paragraphs without bullets, this paragraph's number goes on
+    /// from the last number given on its level instead of starting again
+    /// (#3685).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub continue_list: bool,
 }
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+/// The deepest list level a bullet can have (#3685).
+pub const MAX_LIST_LEVEL: u32 = 20;
 
 impl Default for BulletStyle {
     fn default() -> Self {
@@ -2497,6 +2703,13 @@ impl Default for BulletStyle {
             baseline_shift: 0.0,
             offset: 0.0,
             no_hanging: false,
+            color: None,
+            bold: None,
+            italic: None,
+            level: 0,
+            level_indent: 6.35,
+            restart: false,
+            continue_list: false,
         }
     }
 }
@@ -2505,6 +2718,52 @@ impl BulletStyle {
     /// Nothing beyond the plain symbol bullet: not written to files.
     pub fn is_plain(&self) -> bool {
         *self == BulletStyle::default()
+    }
+
+    /// How far the bullet sits past the left indent: its distance from
+    /// the frame plus its list level's indent (#3685), mm.
+    pub fn lead(&self) -> f64 {
+        let step = if self.level_indent.is_finite() {
+            self.level_indent.max(0.0)
+        } else {
+            0.0
+        };
+        self.offset.max(0.0) + self.level.min(MAX_LIST_LEVEL) as f64 * step
+    }
+
+    /// One list level deeper (`deeper`) or higher (#3685). A number takes
+    /// the next numbering of 1, a, i and a symbol the next of the plain
+    /// bullets, so each level shows apart; `symbol` is the paragraph's
+    /// bullet character. False when the level does not change.
+    pub fn change_level(&mut self, symbol: &mut String, deeper: bool) -> bool {
+        let level = if deeper {
+            (self.level + 1).min(MAX_LIST_LEVEL)
+        } else {
+            self.level.saturating_sub(1)
+        };
+        if level == self.level {
+            return false;
+        }
+        self.level = level;
+        const NUMBERS: [Numbering; 3] = [
+            Numbering::Arabic,
+            Numbering::LowerAlpha,
+            Numbering::LowerRoman,
+        ];
+        const SYMBOLS: [&str; 3] = ["\u{2022}", "\u{25E6}", "\u{25AA}"];
+        let step = |at: usize, n: usize| {
+            if deeper {
+                (at + 1) % n
+            } else {
+                (at + n - 1) % n
+            }
+        };
+        if let Some(at) = NUMBERS.iter().position(|k| *k == self.numbering) {
+            self.numbering = NUMBERS[step(at, NUMBERS.len())];
+        } else if let Some(at) = SYMBOLS.iter().position(|c| c == symbol) {
+            *symbol = SYMBOLS[step(at, SYMBOLS.len())].to_string();
+        }
+        true
     }
 
     /// What the bullet of a paragraph numbered `n` shows: `symbol` or
@@ -2520,19 +2779,43 @@ impl BulletStyle {
 /// The number of each paragraph's bullet, given whether each has bullets
 /// and how it is set: the first of a run of numbered paragraphs takes its
 /// start, the next ones count on; a paragraph without bullets, or with a
-/// symbol, ends the run (#1443).
+/// symbol, ends the run (#1443). Each list level counts on its own: a
+/// paragraph ends the runs of the levels below it, so a sub-list starts
+/// again under each paragraph above it. `restart` starts a paragraph at
+/// its start within a run, and `continue_list` goes on from the last
+/// number of its level after paragraphs without bullets (#3685).
 pub fn bullet_numbers<'a>(paras: impl IntoIterator<Item = (bool, &'a BulletStyle)>) -> Vec<u32> {
     let mut out = Vec::new();
-    let mut next: Option<u32> = None;
+    // The number last given on each level in the current run, and the
+    // last ever given on each level.
+    let mut run: Vec<Option<u32>> = Vec::new();
+    let mut last: Vec<Option<u32>> = Vec::new();
     for (on, b) in paras {
-        if !on || b.numbering == Numbering::Symbol {
-            next = None;
+        if !on {
+            run.clear();
             out.push(0);
             continue;
         }
-        let n = next.unwrap_or(b.start.max(1));
+        let level = b.level.min(MAX_LIST_LEVEL) as usize;
+        run.resize(level + 1, None);
+        if last.len() <= level {
+            last.resize(level + 1, None);
+        }
+        if b.numbering == Numbering::Symbol {
+            run[level] = None;
+            out.push(0);
+            continue;
+        }
+        let start = b.start.max(1);
+        let n = match run[level] {
+            _ if b.restart => start,
+            Some(n) => n + 1,
+            None if b.continue_list => last[level].map_or(start, |n| n + 1),
+            None => start,
+        };
+        run[level] = Some(n);
+        last[level] = Some(n);
         out.push(n);
-        next = Some(n + 1);
     }
     out
 }
@@ -2578,6 +2861,9 @@ pub struct TableCell {
     /// Border of each side; the table's border where unset.
     #[serde(default, skip_serializing_if = "crate::table::CellBorders::is_default")]
     pub borders: crate::table::CellBorders,
+    /// Where the text sits in the cell from top to bottom (#3859).
+    #[serde(default, skip_serializing_if = "crate::table::is_top")]
+    pub valign: VerticalAlign,
 }
 
 fn one_u32() -> u32 {
@@ -2679,6 +2965,9 @@ pub enum PathTextOrientation {
     HorizontalSkew,
     /// Letters stay upright, only moved along the path.
     Upright,
+    /// Each letter turned so its upright lies on a line through the
+    /// middle of the path's box, like the numbers round a dial.
+    Radial,
 }
 
 /// Which line of the letters sits on the path.
@@ -2720,6 +3009,34 @@ pub struct TextOnPath {
     pub orientation: PathTextOrientation,
     #[serde(default)]
     pub vertical: PathTextVertical,
+    /// The text was curved by Curve Text (no path object): which curve
+    /// it took, so the bar shows it and a circle fits round a round
+    /// object it is dropped on. `None`: a path of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<CurvePreset>,
+}
+
+/// The curves of Curve Text (see [`TextOnPath::preset`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CurvePreset {
+    /// Round a whole circle, reading clockwise over the top.
+    Circle,
+    /// Over the top of an arch.
+    ArcUp,
+    /// Along the bottom of a bowl.
+    ArcDown,
+    /// Along a wave.
+    Wave,
+}
+
+impl CurvePreset {
+    pub const ALL: [CurvePreset; 4] = [
+        CurvePreset::Circle,
+        CurvePreset::ArcUp,
+        CurvePreset::ArcDown,
+        CurvePreset::Wave,
+    ];
 }
 
 impl TextOnPath {
@@ -3026,6 +3343,61 @@ impl Baseline {
     }
 }
 
+/// A further fill's look of its own (the Properties docker's Grow, Move
+/// and Blur under the fill): its area grown (or, below nothing, shrunk)
+/// by `grow` mm, moved by `move_x` / `move_y` mm and blurred by `blur`
+/// mm, as live effects on that fill alone, after the object's own.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FillLook {
+    pub grow: f64,
+    pub move_x: f64,
+    pub move_y: f64,
+    pub blur: f64,
+}
+
+impl FillLook {
+    /// No look of its own: the fill drawn as the object is.
+    pub fn is_plain(&self) -> bool {
+        *self == FillLook::default()
+    }
+
+    /// The live effects that draw the look, in order: grow, move, blur.
+    pub fn effects(&self) -> Vec<crate::live::Effect> {
+        use crate::live::Effect;
+        let mut out = Vec::new();
+        if self.grow.abs() > 1e-9 {
+            out.push(Effect::OffsetPath {
+                distance: self.grow,
+                smooth: 0.0,
+                join: Default::default(),
+                merge: false,
+            });
+        }
+        if self.move_x.abs() > 1e-9 || self.move_y.abs() > 1e-9 {
+            out.push(Effect::Transform {
+                scale_x: 100.0,
+                scale_y: 100.0,
+                move_x: self.move_x,
+                move_y: self.move_y,
+                angle: 0.0,
+                copies: 0,
+                reflect_x: false,
+                reflect_y: false,
+                random: false,
+                seed: 0,
+                scale_strokes: false,
+                pivot_x: 0.0,
+                pivot_y: 0.0,
+            });
+        }
+        if self.blur > 1e-9 {
+            out.push(Effect::GaussianBlur { radius: self.blur });
+        }
+        out
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Shape {
     pub id: ShapeId,
@@ -3098,6 +3470,14 @@ pub struct Shape {
     /// of [`Shape::spline`] (#1758).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spline_fixed: Vec<bool>,
+    /// The settings of a curve drawn with the Common Shapes tool (#4045):
+    /// which shape it is, the box it was drawn into and its adjustments,
+    /// so the Shape tool shows its handles and dragging one draws the
+    /// shape again ([`Command::SetCommonShape`]). Any other change to the
+    /// curve's outline, and Convert To Curves, drops them and leaves an
+    /// ordinary curve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub common_shape: Option<Box<CommonShapeParams>>,
     /// The object's identity across saves, undo and moves between
     /// drawings (see [`Uid`]); the engine gives one to every object.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3108,6 +3488,16 @@ pub struct Shape {
     /// frame itself is not drawn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opacity_mask: Option<OpacityMask>,
+    /// How a group's members are put together (see [`GroupLook`]);
+    /// `None` draws them one after another onto what lies beneath.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_look: Option<GroupLook>,
+    /// On a symbol's definition: its stretch zones (see [`ScaleGrid`]),
+    /// which keep the corners of a stretched instance their size. Boxed:
+    /// few objects have them, and every object's size counts where
+    /// drawings nest deep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_grid: Option<Box<ScaleGrid>>,
     /// Effects switched off in the effect stack, each with the place it
     /// holds in the stack; they are kept but not drawn.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3130,6 +3520,10 @@ pub struct Shape {
     /// Further outlines, drawn over `stroke` in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_strokes: Vec<Stroke>,
+    /// The looks of the further fills of their own, one for each of
+    /// `extra_fills` in order (missing ones plain; see [`FillLook`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_looks: Option<Box<Vec<FillLook>>>,
     /// Bitmap effects on an object that is not a bitmap: the object stays
     /// as it is and is drawn as the picture they make of it (see
     /// [`Shape::drawn_as`]).
@@ -3343,6 +3737,69 @@ pub struct ParkedEffect {
     pub effect: crate::live::Effect,
 }
 
+/// How a group's members are put together before the group goes onto
+/// what lies beneath it (see `Shape::group_look`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct GroupLook {
+    /// The group is drawn on its own first, then laid down as one
+    /// picture: its transparency goes on the whole (members that overlap
+    /// do not show through each other) and its members' merge modes mix
+    /// only with the group's own members.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub as_one: bool,
+    /// Each member hides the members beneath it where it lies, even where
+    /// it is see-through: see-through members show what lies beneath the
+    /// group, not the other members. Drawn on its own first, as `as_one`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub knockout: bool,
+}
+
+impl GroupLook {
+    /// Neither set: the same as no look.
+    pub fn is_plain(&self) -> bool {
+        !self.as_one && !self.knockout
+    }
+}
+
+/// A symbol's stretch zones: four lines set in from the sides of its
+/// objects, in millimetres of the symbol's own size. A stretched instance
+/// keeps the corner zones their size, stretches the side zones along
+/// their side and the middle zone both ways (see `scale_grid`).
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct ScaleGrid {
+    pub left: f64,
+    pub right: f64,
+    pub top: f64,
+    pub bottom: f64,
+}
+
+impl ScaleGrid {
+    /// Every inset finite and not below zero.
+    pub fn sanitized(self) -> ScaleGrid {
+        let ok = |v: f64| if v.is_finite() { v.max(0.0) } else { 0.0 };
+        ScaleGrid {
+            left: ok(self.left),
+            right: ok(self.right),
+            top: ok(self.top),
+            bottom: ok(self.bottom),
+        }
+    }
+}
+
+/// The settings of a shape of the Common Shapes tool (see
+/// [`Shape::common_shape`]). The application draws the outline from
+/// them; the document only keeps them with the curve.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommonShapeParams {
+    /// The shape, by the key of its name (such as `shape.arrow`).
+    pub shape: String,
+    /// The box it is drawn into, in local space.
+    pub rect: Rect,
+    /// Its adjustments, in the order the shape defines them.
+    #[serde(default)]
+    pub values: Vec<f64>,
+}
+
 /// How a clip frame masks its contents (see `Shape::opacity_mask`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct OpacityMask {
@@ -3452,13 +3909,17 @@ impl Shape {
             node_types: std::collections::BTreeMap::new(),
             spline: None,
             spline_fixed: Vec::new(),
+            common_shape: None,
             uid: None,
             opacity_mask: None,
+            group_look: None,
+            scale_grid: None,
             parked_effects: Vec::new(),
             cmyk_bitmap: false,
             picture_inks: None,
             extra_fills: Vec::new(),
             extra_strokes: Vec::new(),
+            fill_looks: None,
             raster_fx: None,
             qr: None,
             fill_rule: crate::shaping::FillRule::EvenOdd,
@@ -3514,6 +3975,7 @@ impl Shape {
         s.stroke = None;
         s.extra_fills.clear();
         s.extra_strokes.clear();
+        s.fill_looks = None;
         s.shadow = None;
         s.effects.clear();
         s.parked_effects.clear();
@@ -3531,11 +3993,33 @@ impl Shape {
     /// other shapes and for text whose characters all take the object's
     /// fill, outline and overprint.
     pub fn text_parts(&self) -> Option<Vec<Shape>> {
-        let ShapeKind::Text { spans, .. } = &self.kind else {
+        let ShapeKind::Text {
+            spans, align, para, ..
+        } = &self.kind
+        else {
             return None;
         };
-        if spans.iter().any(|s| s.layout_only)
-            || spans.iter().all(|s| {
+        if spans.iter().any(|s| s.layout_only) || para.bullet_part.is_some() {
+            return None;
+        }
+        // Bullets and numbers of a colour of their own: each colour is a
+        // part of its own (#3682).
+        let mut bullet_colors: Vec<crate::Color> = Vec::new();
+        let styled = spans.iter().any(|s| s.paragraph.is_some());
+        let styles = if styled {
+            crate::paragraphs::paragraph_styles(spans, *align, para)
+        } else {
+            vec![(*align, para.clone())]
+        };
+        for (_, ps) in &styles {
+            if let (true, Some(c)) = (ps.bullets, ps.bullet.color) {
+                if !bullet_colors.contains(&c) {
+                    bullet_colors.push(c);
+                }
+            }
+        }
+        if bullet_colors.is_empty()
+            && spans.iter().all(|s| {
                 s.fill.is_none()
                     && s.outline.is_none()
                     && s.overprint_fill.is_none_or(|o| o == self.overprint_fill)
@@ -3545,6 +4029,7 @@ impl Shape {
         {
             return None;
         }
+        let bullet_part = (!bullet_colors.is_empty()).then_some(BulletPart::Text);
         let look = |s: &TextSpan| -> TextLook {
             let fill = s.fill.clone().unwrap_or_else(|| self.fill.clone());
             let stroke = match &s.outline {
@@ -3566,7 +4051,7 @@ impl Shape {
                 looks.push(l);
             }
         }
-        let parts = looks
+        let mut parts = looks
             .into_iter()
             .enumerate()
             .map(|(i, l)| {
@@ -3581,6 +4066,7 @@ impl Shape {
                         s.overprint_outline = None;
                     }
                     para.frame_fill = None;
+                    para.bullet_part = bullet_part;
                 }
                 part.fill = l.fill;
                 part.stroke = l.stroke;
@@ -3591,7 +4077,25 @@ impl Shape {
                 }
                 part
             })
-            .collect();
+            .collect::<Vec<_>>();
+        for c in bullet_colors {
+            let mut part = self.clone();
+            if let ShapeKind::Text { spans, para, .. } = &mut part.kind {
+                for s in spans.iter_mut() {
+                    s.layout_only = true;
+                    s.background = None;
+                    s.fill = None;
+                    s.outline = None;
+                    s.overprint_fill = None;
+                    s.overprint_outline = None;
+                }
+                para.frame_fill = None;
+                para.bullet_part = Some(BulletPart::Color(c));
+            }
+            part.fill = Fill::Solid(c);
+            part.shadow = None;
+            parts.push(part);
+        }
         Some(parts)
     }
 
@@ -3665,6 +4169,14 @@ impl Shape {
         (effects, parked)
     }
 
+    /// The look of further fill `i` (plain when it has none).
+    pub fn fill_look(&self, i: usize) -> FillLook {
+        self.fill_looks
+            .as_ref()
+            .and_then(|v| v.get(i).copied())
+            .unwrap_or_default()
+    }
+
     /// An object with further fills or outlines as the plain objects that
     /// draw it, bottom first: the outlines drawn behind the fill, its
     /// fill, each further fill, then the other outlines, its own first
@@ -3677,6 +4189,7 @@ impl Shape {
         let mut plain = self.clone();
         plain.extra_fills.clear();
         plain.extra_strokes.clear();
+        plain.fill_looks = None;
         plain.shadow = None;
         let strokes: Vec<&Stroke> = self.stroke.iter().chain(&self.extra_strokes).collect();
         let stroke_part = |st: &Stroke| {
@@ -3695,10 +4208,12 @@ impl Shape {
         let mut fill = plain.clone();
         fill.stroke = None;
         out.push(fill);
-        for f in &self.extra_fills {
+        for (i, f) in self.extra_fills.iter().enumerate() {
             let mut s = plain.clone();
             s.fill = f.clone();
             s.stroke = None;
+            // A look of its own: live effects on this fill alone.
+            s.effects.extend(self.fill_look(i).effects());
             out.push(s);
         }
         out.extend(
@@ -4077,6 +4592,9 @@ impl Shape {
             },
             ShapeKind::Ellipse { rect, arc } => match arc {
                 None => geometry::ellipse_path(*rect),
+                Some(a) if a.pie && a.inner > 0.0 => {
+                    geometry::ellipse_ring_path(*rect, a.start_deg, a.end_deg, a.inner)
+                }
                 Some(a) => geometry::ellipse_arc_path(*rect, a.start_deg, a.end_deg, a.pie),
             },
             ShapeKind::Polygon {
@@ -4085,9 +4603,10 @@ impl Shape {
                 sharpness,
                 complex,
                 twist,
+                bend,
             } => match complex {
                 Some(k) => geometry::complex_star_path(*rect, *points, *k),
-                None => geometry::twisted_polygon_path(*rect, *points, *sharpness, *twist),
+                None => geometry::bent_polygon_path(*rect, *points, *sharpness, *twist, *bend),
             },
             ShapeKind::Path { path, .. } => path.clone(),
             ShapeKind::Text {
@@ -4177,7 +4696,10 @@ impl Shape {
                                     inner.height().max(0.1),
                                 )),
                                 align: cell.align,
-                                para: ParagraphStyle::default(),
+                                para: ParagraphStyle {
+                                    vertical_align: cell.valign,
+                                    ..ParagraphStyle::default()
+                                },
                                 on_path: None,
                             },
                         );
@@ -4206,7 +4728,13 @@ impl Shape {
             }
             ShapeKind::SymbolInstance { index } => symbols
                 .get(*index)
-                .map(|s| vec![s.shape.clone()])
+                .map(|s| {
+                    // Stretch zones keep a stretched instance's corners.
+                    let shaped = s.shape.scale_grid.as_deref().and_then(|g| {
+                        crate::scale_grid::stretched(&s.shape, *g, self.transform, symbols)
+                    });
+                    vec![shaped.unwrap_or_else(|| s.shape.clone())]
+                })
                 .unwrap_or_default(),
             _ => Vec::new(),
         }
@@ -4214,13 +4742,12 @@ impl Shape {
 
     /// Whether Convert to Curves changes this object: curves already are
     /// curves, a bitmap has no outline to become one, and a group changes
-    /// when something it holds does (as in CorelDRAW, a group converts
-    /// whole and stays a group, #1324).
+    /// when something it holds does.
     pub fn converts_to_curves(&self) -> bool {
         match &self.kind {
             // A B-spline becomes an ordinary curve: its nodes instead of
             // its control points.
-            ShapeKind::Path { .. } => self.spline.is_some(),
+            ShapeKind::Path { .. } => self.spline.is_some() || self.common_shape.is_some(),
             ShapeKind::Bitmap { .. } => false,
             ShapeKind::Group { children } => {
                 let warps = !self.outline_stays_live();
@@ -4283,6 +4810,7 @@ impl Shape {
             out.node_types.clear();
             out.spline = None;
             out.spline_fixed.clear();
+            out.common_shape = None;
             changed = true;
         }
         if !container {
@@ -4361,15 +4889,40 @@ impl Shape {
             }
             // A B-spline keeps its outline; the control points go.
             ShapeKind::Path { .. } => Some(self.kind.clone()),
+            // Characters with a fill or outline of their own: a group of
+            // curves, one a look, each in its own colours. All took the
+            // object's fill (#3107).
+            ShapeKind::Text { .. } if self.text_parts().is_some() => {
+                let children: Vec<Shape> = self
+                    .text_parts()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|p| {
+                        let path = crate::shaping::nonzero_as_even_odd(&p.local_path());
+                        if path.elements().is_empty() {
+                            return None;
+                        }
+                        let mut c = Shape::new(next_id(), ShapeKind::Path { path, closed: true });
+                        c.fill = p.fill;
+                        c.stroke = p.stroke;
+                        c.overprint_fill = p.overprint_fill;
+                        c.overprint_outline = p.overprint_outline;
+                        Some(c)
+                    })
+                    .collect();
+                Some(ShapeKind::Group { children })
+            }
             // Text fills with the nonzero rule, curves with even-odd: the
             // overlapping strokes of a glyph would leave holes (#800).
             ShapeKind::Text { .. } => Some(ShapeKind::Path {
                 path: crate::shaping::nonzero_as_even_odd(&self.local_path()),
                 closed: true,
             }),
+            // An open arc stays an open curve, its arrowheads with it; it
+            // was closed and lost them (#2983).
             _ => Some(ShapeKind::Path {
                 path: self.local_path(),
-                closed: true,
+                closed: !self.kind.is_open_curve(),
             }),
         }
     }
@@ -4402,6 +4955,7 @@ impl Shape {
                     self.node_types.clear();
                     self.spline = None;
                     self.spline_fixed.clear();
+                    self.common_shape = None;
                 }
                 if bake && !container {
                     if let Some(b) = crate::live::bake_outline_warps(self) {
@@ -4461,6 +5015,7 @@ impl Shape {
                     self.node_types.clear();
                     self.spline = None;
                     self.spline_fixed.clear();
+                    self.common_shape = None;
                 }
                 if bake && !container {
                     if let Some(b) = crate::live::bake_outline_warps(self) {
@@ -4487,6 +5042,79 @@ impl Shape {
             }
             _ => self.local_path(),
         }
+    }
+
+    /// `self` is or holds (in groups and clip frames, up to eight levels
+    /// deep) a symbol instance.
+    pub fn holds_symbol_instance(&self) -> bool {
+        const DEEPEST: usize = 8;
+        fn holds(s: &Shape, depth: usize) -> bool {
+            depth <= DEEPEST
+                && match &s.kind {
+                    ShapeKind::SymbolInstance { .. } => true,
+                    ShapeKind::Group { children } => children.iter().any(|c| holds(c, depth + 1)),
+                    ShapeKind::ClipFrame { frame, contents } => {
+                        holds(frame, depth + 1) || contents.iter().any(|c| holds(c, depth + 1))
+                    }
+                    _ => false,
+                }
+        }
+        holds(self, 0)
+    }
+
+    /// `self` with every symbol instance it is or holds (in groups, clip
+    /// frames and nested symbol definitions, up to eight levels deep)
+    /// replaced by its symbol's objects placed as the instance places
+    /// them. `None` when `self` holds no instance.
+    pub fn with_symbols_drawn(&self, symbols: &[Symbol]) -> Option<Shape> {
+        fn drawn(s: &Shape, symbols: &[Symbol], depth: usize) -> Shape {
+            const DEEPEST: usize = 8;
+            if depth > DEEPEST {
+                return s.clone();
+            }
+            match &s.kind {
+                ShapeKind::SymbolInstance { .. } => match s.expand(symbols).into_iter().next() {
+                    Some(exp) => {
+                        let mut d = drawn(&exp, symbols, depth + 1);
+                        d.absorb(s.transform);
+                        if !s.effects.is_empty() {
+                            let mut g = s.clone();
+                            g.kind = ShapeKind::Group { children: vec![d] };
+                            g.transform = Affine::IDENTITY;
+                            g
+                        } else {
+                            d.id = s.id;
+                            d
+                        }
+                    }
+                    None => s.clone(),
+                },
+                ShapeKind::Group { children } => {
+                    let mut g = s.clone();
+                    g.kind = ShapeKind::Group {
+                        children: children
+                            .iter()
+                            .map(|c| drawn(c, symbols, depth + 1))
+                            .collect(),
+                    };
+                    g
+                }
+                ShapeKind::ClipFrame { frame, contents } => {
+                    let mut c = s.clone();
+                    c.kind = ShapeKind::ClipFrame {
+                        frame: Box::new(drawn(frame, symbols, depth + 1)),
+                        contents: contents
+                            .iter()
+                            .map(|k| drawn(k, symbols, depth + 1))
+                            .collect(),
+                    };
+                    c
+                }
+                _ => s.clone(),
+            }
+        }
+        self.holds_symbol_instance()
+            .then(|| drawn(self, symbols, 0))
     }
 
     /// Apply `t` to the object (in the space its transform maps to): its
@@ -4630,6 +5258,68 @@ impl Shape {
     }
 
     pub fn bounds(&self) -> Rect {
+        self.bounds_under(Affine::IDENTITY)
+    }
+
+    /// The exact box of the shape in its own (local) coordinates. Kinds
+    /// that know their box answer without an outline; a curve's box is
+    /// read off its stored path, not off a copy of it.
+    pub fn local_bounds(&self) -> Rect {
+        match &self.kind {
+            ShapeKind::Path { path, .. } => path.bounding_box(),
+            ShapeKind::Group { children } => {
+                // A member that draws nothing takes no room, as in
+                // [`Shape::bounds_under`] (#996).
+                children
+                    .iter()
+                    .filter(|c| !c.is_empty_path())
+                    .map(|c| c.bounds())
+                    .reduce(|a, b| a.union(b))
+                    .unwrap_or_else(|| self.local_path().bounding_box())
+            }
+            ShapeKind::ClipFrame { frame, .. } => frame.bounds(),
+            _ => match self.kind.known_box() {
+                Some(r) => r,
+                None => self.local_path().bounding_box(),
+            },
+        }
+    }
+
+    /// [`Shape::bounds`] with `outer` applied on top of the shape's own
+    /// transformation. A group passes its transformation down instead of
+    /// copying each member with it: the copy took the member's whole
+    /// subtree, so groups nested deep were copied once per level, which
+    /// on a drawing of a million nested objects ran out of memory (#3340).
+    fn bounds_under(&self, outer: Affine) -> Rect {
+        match &self.kind {
+            ShapeKind::Group { children } => {
+                // A member that draws nothing (an empty curve, such as a
+                // dimension's arrowheads when it has none) takes no room:
+                // its box would stretch the group's to the origin (#996).
+                let t = outer * self.transform;
+                children
+                    .iter()
+                    .filter(|c| !c.is_empty_path())
+                    .map(|c| c.bounds_under(t))
+                    .reduce(|a, b| a.union(b))
+                    .unwrap_or_else(|| (outer * self.page_path()).bounding_box())
+            }
+            _ if outer == Affine::IDENTITY => self.own_bounds(),
+            // A curve's box from its own segments, each placed as it is
+            // measured: the whole curve was copied (and copied again with
+            // its transformation) for every box asked for, a cost on long
+            // curves many times a frame (#3559).
+            ShapeKind::Path { path, .. } => path_bounds_under(path, outer * self.transform),
+            _ => {
+                let mut c = self.clone();
+                c.transform = outer * c.transform;
+                c.own_bounds()
+            }
+        }
+    }
+
+    /// [`Shape::bounds`] of an object that is not a group.
+    fn own_bounds(&self) -> Rect {
         match &self.kind {
             ShapeKind::Text {
                 origin,
@@ -4657,20 +5347,14 @@ impl Shape {
             ShapeKind::Text { .. } => self
                 .text_bounds()
                 .unwrap_or_else(|| self.page_path().bounding_box()),
-            // A member that draws nothing (an empty curve, such as a
-            // dimension's arrowheads when it has none) takes no room:
-            // its box would stretch the group's to the origin (#996).
-            ShapeKind::Group { children } => children
-                .iter()
-                .filter(|c| !c.is_empty_path())
-                .map(|c| {
-                    let mut c = c.clone();
-                    c.transform = self.transform * c.transform;
-                    c.bounds()
-                })
-                .reduce(|a, b| a.union(b))
-                .unwrap_or_else(|| self.page_path().bounding_box()),
-            _ => self.page_path().bounding_box(),
+            ShapeKind::Path { path, .. } => path_bounds_under(path, self.transform),
+            // A rectangle, a whole ellipse, a bitmap, a table or a
+            // symbol's box is known without an outline; a move, scale or
+            // mirror (no turn or skew) maps the box exactly.
+            _ => match self.kind.known_box().filter(|_| axis_aligned(self.transform)) {
+                Some(r) => self.transform.transform_rect_bbox(r),
+                None => self.page_path().bounding_box(),
+            },
         }
     }
 
@@ -4701,6 +5385,16 @@ impl Shape {
             _ => None,
         }
     }
+}
+
+/// The box of `path` placed by `t`, the same as
+/// `(t * path).bounding_box()` without copying the curve: each segment is
+/// placed and measured on its own (#3559).
+fn path_bounds_under(path: &BezPath, t: Affine) -> Rect {
+    path.segments()
+        .map(|seg| (t * seg).bounding_box())
+        .reduce(|a, b| a.union(b))
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5126,6 +5820,82 @@ pub fn draws_symbol(shape: &Shape, index: usize, symbols: &[Symbol]) -> bool {
     walk(shape, index, symbols, &mut seen)
 }
 
+/// The most objects one symbol stands for, the objects of the symbols
+/// it draws counted in: more is a file built to never finish drawing.
+pub const SYMBOL_MAX_OBJECTS: u64 = 1_000_000;
+
+/// The most symbols one symbol draws inside one another.
+pub const SYMBOL_MAX_NESTING: usize = 64;
+
+impl Document {
+    /// Turn every instance in a symbol that would draw without end, or
+    /// far past what any drawing holds, into an empty group in its place.
+    /// A file whose symbol drew itself (directly or through another one)
+    /// overflowed the stack and ended the program when drawn, and one of
+    /// 40 symbols each drawing the one before twice stood for a trillion
+    /// objects and never finished. Edit Symbol already refuses a symbol
+    /// drawing itself; this mends a file made elsewhere.
+    pub fn break_symbol_loops(&mut self) {
+        const OPEN: u64 = u64::MAX;
+        // Objects each symbol stands for; OPEN while it is being walked.
+        let mut size: Vec<Option<u64>> = vec![None; self.symbols.len()];
+        fn symbol(i: usize, syms: &mut [Symbol], size: &mut [Option<u64>], depth: usize) -> u64 {
+            if let Some(n) = size[i] {
+                return n;
+            }
+            size[i] = Some(OPEN);
+            let mut shape = std::mem::replace(
+                &mut syms[i].shape,
+                Shape::new(
+                    ShapeId(0),
+                    ShapeKind::Group {
+                        children: Vec::new(),
+                    },
+                ),
+            );
+            let n = walk(&mut shape, syms, size, depth);
+            syms[i].shape = shape;
+            size[i] = Some(n);
+            n
+        }
+        fn walk(s: &mut Shape, syms: &mut [Symbol], size: &mut [Option<u64>], depth: usize) -> u64 {
+            let n = match &mut s.kind {
+                ShapeKind::SymbolInstance { index } => {
+                    let i = *index;
+                    if i >= syms.len() {
+                        return 1;
+                    }
+                    let n = match size[i] {
+                        Some(OPEN) => OPEN,
+                        _ if depth >= SYMBOL_MAX_NESTING => OPEN,
+                        _ => symbol(i, syms, size, depth + 1),
+                    };
+                    if n > SYMBOL_MAX_OBJECTS {
+                        s.kind = ShapeKind::Group {
+                            children: Vec::new(),
+                        };
+                        return 1;
+                    }
+                    n
+                }
+                ShapeKind::Group { children } => children
+                    .iter_mut()
+                    .fold(0u64, |a, c| a.saturating_add(walk(c, syms, size, depth))),
+                ShapeKind::ClipFrame { frame, contents } => contents
+                    .iter_mut()
+                    .fold(walk(frame, syms, size, depth), |a, c| {
+                        a.saturating_add(walk(c, syms, size, depth))
+                    }),
+                _ => 0,
+            };
+            n.saturating_add(1)
+        }
+        for i in 0..self.symbols.len() {
+            symbol(i, &mut self.symbols, &mut size, 0);
+        }
+    }
+}
+
 /// Document properties (File > Document Properties).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -5338,6 +6108,18 @@ impl PrimaryColorMode {
             PrimaryColorMode::Rgb => crate::Color::BLACK,
         }
     }
+
+    /// A grey of `k` % black in this mode: `k` % K in CMYK, the RGB grey
+    /// that light in RGB (#3006).
+    pub fn gray(self, k: f32) -> crate::Color {
+        match self {
+            PrimaryColorMode::Cmyk => crate::Color::cmyk_pct(0.0, 0.0, 0.0, k),
+            PrimaryColorMode::Rgb => {
+                let v = (1.0 - k / 100.0).clamp(0.0, 1.0);
+                crate::Color::Rgb { r: v, g: v, b: v }
+            }
+        }
+    }
 }
 
 /// How a page number field shows the number (Layout > Insert Page
@@ -5356,26 +6138,83 @@ pub struct PageNumberField {
     pub prefix: String,
     #[serde(default)]
     pub suffix: String,
+    /// The last pages, this many of them, show no number, such as a back
+    /// cover (#3789).
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub skip_last: usize,
+    /// Pages left without a number ("5, 9-10", from 1); the numbering
+    /// goes on after them without counting them (#3789).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub skip: String,
 }
 
 fn first_numbered_page() -> usize {
     1
 }
 
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
+}
+
+impl Default for PageNumberField {
+    fn default() -> Self {
+        PageNumberField {
+            start_at: 1,
+            first_page: 1,
+            style: 0,
+            prefix: String::new(),
+            suffix: String::new(),
+            skip_last: 0,
+            skip: String::new(),
+        }
+    }
+}
+
 impl PageNumberField {
     /// The page at `index` (0-based) shows a number: it is not one of
     /// the pages before the first numbered page (#2127).
     pub fn numbers(&self, index: usize) -> bool {
+        self.numbers_in(index, usize::MAX)
+    }
+
+    /// The page at `index` (0-based) of a drawing of `pages` pages shows
+    /// a number: it is not before the first numbered page (#2127), nor
+    /// one of the last pages left out or one of the pages listed to skip
+    /// (#3789).
+    pub fn numbers_in(&self, index: usize, pages: usize) -> bool {
         index + 1 >= self.first_page.max(1)
+            && index < pages.saturating_sub(self.skip_last)
+            && !self.skips(index)
+    }
+
+    /// The page at `index` is one of the pages listed to skip.
+    fn skips(&self, index: usize) -> bool {
+        !self.skip.trim().is_empty() && parse_page_range(&self.skip, index + 1).contains(&index)
     }
 
     /// The text for the page at `index` (0-based): empty on the pages
     /// before the first numbered page (#2127).
     pub fn label(&self, index: usize) -> String {
-        if !self.numbers(index) {
+        self.label_in(index, usize::MAX)
+    }
+
+    /// The text for the page at `index` (0-based) of a drawing of `pages`
+    /// pages: empty on a page that shows no number; the pages skipped
+    /// before it are not counted (#3789).
+    pub fn label_in(&self, index: usize, pages: usize) -> String {
+        if !self.numbers_in(index, pages) {
             return String::new();
         }
-        let n = self.start_at + index as i64 - (self.first_page.max(1) as i64 - 1);
+        let first = self.first_page.max(1) - 1;
+        let skipped = if self.skip.trim().is_empty() {
+            0
+        } else {
+            parse_page_range(&self.skip, index + 1)
+                .into_iter()
+                .filter(|i| *i >= first && *i < index)
+                .count()
+        };
+        let n = self.start_at + index as i64 - first as i64 - skipped as i64;
         let body = match self.style {
             1 => roman(n),
             2 => roman(n).to_lowercase(),
@@ -5447,8 +6286,14 @@ impl Shape {
     /// Page number fields in this object show the number of the page at
     /// `index` (0-based).
     pub fn show_page_number(&mut self, index: usize) {
+        self.show_page_number_of(index, usize::MAX);
+    }
+
+    /// Page number fields in this object show the number of the page at
+    /// `index` (0-based) of a drawing of `pages` pages (#3789).
+    pub fn show_page_number_of(&mut self, index: usize, pages: usize) {
         if let (Some(f), ShapeKind::Text { spans, .. }) = (&self.page_number, &mut self.kind) {
-            let label = f.label(index);
+            let label = f.label_in(index, pages);
             spans.truncate(1);
             if let Some(first) = spans.first_mut() {
                 first.text = label;
@@ -5456,7 +6301,7 @@ impl Shape {
         }
         if let ShapeKind::Group { children } = &mut self.kind {
             for c in children {
-                c.show_page_number(index);
+                c.show_page_number_of(index, pages);
             }
         }
     }
@@ -5602,7 +6447,7 @@ impl GuideStyle {
 
 /// A guideline on a page: its line, and how it looks. A guideline
 /// without its own colour uses the document's default guideline colour.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Guide {
     #[serde(flatten)]
     pub line: GuideLine,
@@ -5617,6 +6462,10 @@ pub struct Guide {
     /// or snapped to, while the others of its set show (#1775).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
+    /// The name given in the Objects docker (Rename), shown in its row
+    /// instead of where the guideline is (#3574).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 impl From<GuideLine> for Guide {
@@ -5627,6 +6476,7 @@ impl From<GuideLine> for Guide {
             style: GuideStyle::default(),
             locked: false,
             hidden: false,
+            name: None,
         }
     }
 }
@@ -5654,13 +6504,16 @@ impl Guide {
     pub fn through(&self, p: crate::geometry::Point) -> Guide {
         Guide {
             line: self.line.through(p),
-            ..*self
+            ..self.clone()
         }
     }
 
     /// The same guideline with another line.
     pub fn with_line(&self, line: GuideLine) -> Guide {
-        Guide { line, ..*self }
+        Guide {
+            line,
+            ..self.clone()
+        }
     }
 }
 
@@ -5727,6 +6580,10 @@ pub struct RulerSettings {
     /// or "m"), kept for the dialog; empty for millimetres.
     pub scale_page_units: String,
     pub scale_world_units: String,
+    /// The vertical ruler counts from the top of the page downwards, its
+    /// origin mirrored within the page (#3872); off: from the bottom up.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub vertical_from_top: bool,
 }
 
 impl Default for RulerSettings {
@@ -5739,11 +6596,24 @@ impl Default for RulerSettings {
             scale_world: 1.0,
             scale_page_units: String::new(),
             scale_world_units: String::new(),
+            vertical_from_top: false,
         }
     }
 }
 
 impl RulerSettings {
+    /// The page y (mm) the vertical ruler counts from on a page whose
+    /// bottom and top are `bottom` and `top`: the origin, or with the
+    /// ruler counting from the top the origin mirrored within the page,
+    /// so the default origin lies at the top edge (#3872).
+    pub fn vertical_zero(&self, bottom: f64, top: f64) -> f64 {
+        if self.vertical_from_top {
+            top + bottom - self.origin_y
+        } else {
+            self.origin_y
+        }
+    }
+
     /// World millimetres per page millimetre: 1 for a 1:1 drawing, 100 for
     /// 1:100. Never zero, negative or infinite (1 then).
     pub fn world_per_page(&self) -> f64 {
@@ -5868,6 +6738,76 @@ pub struct Document {
     /// Review comments pinned to the pages (never printed or exported).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub comments: Vec<Comment>,
+    /// Where the object found last by its id lay, so looking up the
+    /// objects of a selection one after the other does not walk the
+    /// whole drawing for each (never saved, never compared).
+    #[serde(skip)]
+    pub find_hint: FindHint,
+}
+
+/// The layer (counted as [`Document::all_layers`] gives them) and the
+/// place among its objects of the object [`Document::find_shape`] found
+/// last. Only a hint: a lookup checks the object there first and walks
+/// the drawing when it is not the one, so a stale hint costs nothing.
+///
+/// It also keeps where each object on a layer was when the drawing was
+/// last walked ([`FindHint::tops`]), checked on use like the hint: the
+/// objects of a large selection looked up out of drawing order
+/// (Distribute, Align) each walked the drawing again.
+#[derive(Debug, Default)]
+pub struct FindHint(
+    std::sync::atomic::AtomicU64,
+    std::sync::Mutex<std::collections::HashMap<ShapeId, (u32, u32)>>,
+);
+
+impl FindHint {
+    fn get(&self) -> (usize, usize) {
+        let v = self.0.load(std::sync::atomic::Ordering::Relaxed);
+        ((v >> 32) as usize, (v & 0xffff_ffff) as usize)
+    }
+
+    fn set(&self, layer: usize, index: usize) {
+        let v = ((layer as u64 & 0xffff_ffff) << 32) | (index as u64 & 0xffff_ffff);
+        self.0.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl FindHint {
+    /// Where the object on a layer `id` was last seen, if it was.
+    fn top(&self, id: ShapeId) -> Option<(usize, usize)> {
+        let map = self.1.lock().ok()?;
+        map.get(&id).map(|&(k, i)| (k as usize, i as usize))
+    }
+
+    /// Note where each object on the layers `layers` is now.
+    fn note_tops<'a>(&self, layers: impl Iterator<Item = &'a Layer>) {
+        let Ok(mut map) = self.1.lock() else {
+            return;
+        };
+        map.clear();
+        for (k, layer) in layers.enumerate() {
+            for (i, s) in layer.shapes.iter().enumerate() {
+                map.insert(s.id, (k as u32, i as u32));
+            }
+        }
+    }
+}
+
+impl Clone for FindHint {
+    fn clone(&self) -> Self {
+        FindHint(
+            std::sync::atomic::AtomicU64::new(self.0.load(std::sync::atomic::Ordering::Relaxed)),
+            Default::default(),
+        )
+    }
+}
+
+/// A hint is no part of the drawing: two drawings are equal whatever
+/// their hints.
+impl PartialEq for FindHint {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 /// What a comment points at on its page (page millimetres).
@@ -6133,6 +7073,39 @@ impl TimeTracker {
     }
 }
 
+/// `s` itself when it is `id`, or the object `id` in it (in its groups
+/// and clip frames).
+/// Whether `s` is `id` or holds it (in a group or clip frame).
+pub(crate) fn holds(s: &Shape, id: ShapeId) -> bool {
+    find_in(s, id).is_some()
+}
+
+fn find_in(s: &Shape, id: ShapeId) -> Option<&Shape> {
+    if s.id == id {
+        return Some(s);
+    }
+    match &s.kind {
+        ShapeKind::Group { children } => children.iter().find_map(|c| find_in(c, id)),
+        ShapeKind::ClipFrame { frame, contents } => {
+            find_in(frame, id).or_else(|| contents.iter().find_map(|c| find_in(c, id)))
+        }
+        _ => None,
+    }
+}
+
+fn wraps_along_path(s: &Shape, id: ShapeId) -> Option<bool> {
+    if s.id == id {
+        return Some(s.wrap_text);
+    }
+    let child = match &s.kind {
+        ShapeKind::Group { children } => children.iter().find_map(|c| wraps_along_path(c, id)),
+        ShapeKind::ClipFrame { frame, contents } => wraps_along_path(frame, id)
+            .or_else(|| contents.iter().find_map(|c| wraps_along_path(c, id))),
+        _ => None,
+    }?;
+    Some(s.wrap_text || child)
+}
+
 impl Default for Document {
     fn default() -> Self {
         Document::new("Untitled", paper::A4)
@@ -6176,6 +7149,7 @@ impl Document {
             cmyk_profile: None,
             inks: Vec::new(),
             comments: Vec::new(),
+            find_hint: FindHint::default(),
         }
     }
 
@@ -6212,6 +7186,38 @@ impl Document {
         self.master
             .iter()
             .chain(self.pages.iter().flat_map(|p| &p.layers))
+    }
+
+    /// The layer number `k` of [`Document::all_layers`], without walking
+    /// the layers before it: only the pages are counted (each lookup of
+    /// an object walked every layer of a drawing of thousands of pages,
+    /// which made filling a large print merge slow).
+    fn nth_layer(&self, mut k: usize) -> Option<&Layer> {
+        if k < self.master.len() {
+            return self.master.get(k);
+        }
+        k -= self.master.len();
+        for p in &self.pages {
+            if k < p.layers.len() {
+                return p.layers.get(k);
+            }
+            k -= p.layers.len();
+        }
+        None
+    }
+
+    fn nth_layer_mut(&mut self, mut k: usize) -> Option<&mut Layer> {
+        if k < self.master.len() {
+            return self.master.get_mut(k);
+        }
+        k -= self.master.len();
+        for p in &mut self.pages {
+            if k < p.layers.len() {
+                return p.layers.get_mut(k);
+            }
+            k -= p.layers.len();
+        }
+        None
     }
 
     pub fn all_layers_mut(&mut self) -> impl Iterator<Item = &mut Layer> {
@@ -6334,7 +7340,7 @@ impl Document {
             .iter()
             .chain(own.iter())
             .filter(|g| !g.hidden)
-            .copied()
+            .cloned()
             .collect())
     }
 
@@ -6367,6 +7373,7 @@ impl Document {
     pub fn layers_drawn_for_page(&self, page: PageId) -> Result<Vec<std::borrow::Cow<'_, Layer>>> {
         use std::borrow::Cow;
         let idx = self.page_index(page)?;
+        let count = self.pages.len();
         // The headings, found once for the tables of contents (#1660).
         let entries = std::cell::OnceCell::new();
         Ok(self
@@ -6379,11 +7386,11 @@ impl Document {
                     let mut l = l.clone();
                     if master {
                         l.shapes
-                            .retain(|s| s.page_number.as_ref().is_none_or(|f| f.numbers(idx)));
+                            .retain(|s| s.page_number.as_ref().is_none_or(|f| f.numbers_in(idx, count)));
                     }
                     for s in &mut l.shapes {
                         if master {
-                            s.show_page_number(idx);
+                            s.show_page_number_of(idx, count);
                         }
                         s.show_toc(entries);
                     }
@@ -6393,9 +7400,9 @@ impl Document {
                     // A field on a page before the first numbered page
                     // is left out (#2127).
                     l.shapes
-                        .retain(|s| s.page_number.as_ref().is_none_or(|f| f.numbers(idx)));
+                        .retain(|s| s.page_number.as_ref().is_none_or(|f| f.numbers_in(idx, count)));
                     for s in &mut l.shapes {
-                        s.show_page_number(idx);
+                        s.show_page_number_of(idx, count);
                     }
                     Cow::Owned(l)
                 } else {
@@ -6426,50 +7433,150 @@ impl Document {
 
     /// Find a top-level shape and the layer holding it.
     pub fn shape(&self, id: ShapeId) -> Result<(&Layer, &Shape)> {
-        for layer in self.all_layers() {
-            if let Some(s) = layer.shapes.iter().find(|s| s.id == id) {
-                return Ok((layer, s));
-            }
-        }
-        Err(Error::ShapeNotFound(id))
+        let (k, i) = self.locate_on_layer(id).ok_or(Error::ShapeNotFound(id))?;
+        let layer = self.nth_layer(k).ok_or(Error::ShapeNotFound(id))?;
+        Ok((layer, &layer.shapes[i]))
     }
 
     pub fn shape_mut(&mut self, id: ShapeId) -> Result<&mut Shape> {
-        for layer in self.all_layers_mut() {
-            if let Some(s) = layer.shapes.iter_mut().find(|s| s.id == id) {
-                return Ok(s);
+        let (k, i) = self.locate_on_layer(id).ok_or(Error::ShapeNotFound(id))?;
+        self.nth_layer_mut(k)
+            .and_then(|l| l.shapes.get_mut(i))
+            .ok_or(Error::ShapeNotFound(id))
+    }
+
+    /// The layer number and place of the object `id` lying on a layer
+    /// (not in a group), trying where the last lookup found its object,
+    /// and the places next to it, first (see [`FindHint`]).
+    fn locate_on_layer(&self, id: ShapeId) -> Option<(usize, usize)> {
+        let (k, i) = self.find_hint.get();
+        if let Some(layer) = self.nth_layer(k) {
+            for j in [i, i + 1, i.wrapping_sub(1)] {
+                if layer.shapes.get(j).is_some_and(|s| s.id == id) {
+                    self.find_hint.set(k, j);
+                    return Some((k, j));
+                }
             }
         }
-        Err(Error::ShapeNotFound(id))
+        for (k, layer) in self.all_layers().enumerate() {
+            if let Some(i) = layer.shapes.iter().position(|s| s.id == id) {
+                self.find_hint.set(k, i);
+                return Some((k, i));
+            }
+        }
+        None
     }
 
     /// Position of a shape: (layer id, index inside the layer).
     pub fn locate(&self, id: ShapeId) -> Result<(LayerId, usize)> {
-        for layer in self.all_layers() {
-            if let Some(i) = layer.shapes.iter().position(|s| s.id == id) {
-                return Ok((layer.id, i));
-            }
-        }
-        Err(Error::ShapeNotFound(id))
+        let (k, i) = self.locate_on_layer(id).ok_or(Error::ShapeNotFound(id))?;
+        let layer = self.nth_layer(k).ok_or(Error::ShapeNotFound(id))?;
+        Ok((layer.id, i))
     }
 
     /// Find any shape, including children of groups and clip frames.
     pub fn find_shape(&self, id: ShapeId) -> Option<&Shape> {
-        fn walk(s: &Shape, id: ShapeId) -> Option<&Shape> {
-            if s.id == id {
-                return Some(s);
+        let (k, i) = self.locate_top(id)?;
+        let top = self.nth_layer(k)?.shapes.get(i)?;
+        find_in(top, id)
+    }
+
+    /// True when `id` or an enclosing group or clip frame has `wrap_text` on.
+    pub fn shape_or_ancestor_wraps_text(&self, id: ShapeId) -> bool {
+        let Some((k, i)) = self.locate_top(id) else {
+            return false;
+        };
+        self.nth_layer(k)
+            .and_then(|l| l.shapes.get(i))
+            .and_then(|top| wraps_along_path(top, id))
+            .unwrap_or(false)
+    }
+
+    /// The layer number and the place on it of the object on a layer
+    /// that is `id` or holds it (in a group or clip frame), trying where
+    /// the last lookup found its object, and the places next to it,
+    /// first (each object of a selection of thousands walked the
+    /// whole drawing to be found, so moving them all took seconds).
+    fn locate_top(&self, id: ShapeId) -> Option<(usize, usize)> {
+        let (k, i) = self.find_hint.get();
+        if let Some(layer) = self.nth_layer(k) {
+            if layer
+                .shapes
+                .get(i)
+                .is_some_and(|s| find_in(s, id).is_some())
+            {
+                return Some((k, i));
             }
-            match &s.kind {
-                ShapeKind::Group { children } => children.iter().find_map(|c| walk(c, id)),
-                ShapeKind::ClipFrame { frame, contents } => {
-                    walk(frame, id).or_else(|| contents.iter().find_map(|c| walk(c, id)))
+            for j in [i + 1, i.wrapping_sub(1)] {
+                if layer.shapes.get(j).is_some_and(|s| s.id == id) {
+                    self.find_hint.set(k, j);
+                    return Some((k, j));
                 }
-                _ => None,
             }
         }
-        self.all_layers()
-            .flat_map(|l| &l.shapes)
-            .find_map(|s| walk(s, id))
+        // Where it was when the drawing was last walked, if it is still
+        // there.
+        if let Some((k, i)) = self.find_hint.top(id) {
+            if self
+                .nth_layer(k)
+                .and_then(|l| l.shapes.get(i))
+                .is_some_and(|s| s.id == id)
+            {
+                self.find_hint.set(k, i);
+                return Some((k, i));
+            }
+        }
+        for (k, layer) in self.all_layers().enumerate() {
+            if let Some(i) = layer.shapes.iter().position(|s| find_in(s, id).is_some()) {
+                self.find_hint.set(k, i);
+                // An object on a layer that was not where it was last
+                // seen: note where they all are now, for the next ones.
+                if layer.shapes[i].id == id {
+                    self.find_hint.note_tops(self.all_layers());
+                }
+                return Some((k, i));
+            }
+        }
+        None
+    }
+
+    /// Keep in `ids` only the objects still in the drawing (on a layer or
+    /// inside a group or clip frame), in their order. A long list is
+    /// checked against one walk of the drawing: looking up thousands of
+    /// objects that are gone (after Undo of a Duplicate) walked it once
+    /// for each.
+    pub fn retain_existing(&self, ids: &mut Vec<ShapeId>) {
+        if ids.len() <= 16 {
+            ids.retain(|id| self.find_shape(*id).is_some());
+            return;
+        }
+        let mut all = std::collections::HashSet::new();
+        fn walk(s: &Shape, all: &mut std::collections::HashSet<ShapeId>, depth: usize) {
+            all.insert(s.id);
+            if depth > 512 {
+                return;
+            }
+            match &s.kind {
+                ShapeKind::Group { children } => {
+                    for c in children {
+                        walk(c, all, depth + 1);
+                    }
+                }
+                ShapeKind::ClipFrame { frame, contents } => {
+                    walk(frame, all, depth + 1);
+                    for c in contents {
+                        walk(c, all, depth + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for layer in self.all_layers() {
+            for s in &layer.shapes {
+                walk(s, &mut all, 0);
+            }
+        }
+        ids.retain(|id| all.contains(id));
     }
 
     /// Find any shape to change it, including children of groups and clip
@@ -6487,9 +7594,9 @@ impl Document {
                 _ => None,
             }
         }
-        self.all_layers_mut()
-            .flat_map(|l| &mut l.shapes)
-            .find_map(|s| walk(s, id))
+        let (k, i) = self.locate_top(id)?;
+        let top = self.nth_layer_mut(k)?.shapes.get_mut(i)?;
+        walk(top, id)
     }
 
     /// The transform taking the space of `id` to the page: the product of
@@ -6509,9 +7616,9 @@ impl Document {
                 _ => None,
             }
         }
-        self.all_layers()
-            .flat_map(|l| &l.shapes)
-            .find_map(|s| walk(s, id, Affine::IDENTITY))
+        let (k, i) = self.locate_top(id)?;
+        let top = self.nth_layer(k)?.shapes.get(i)?;
+        walk(top, id, Affine::IDENTITY)
     }
 
     /// A copy of any object, nested ones too, whose transform takes it
@@ -6548,13 +7655,17 @@ impl Document {
             }
             found
         }
+        // Only the object on a layer that holds it is walked: walking the
+        // drawing from its start for each of thousands of objects (Convert
+        // to Curves before Combine) took seconds.
+        let Some((k, i)) = self.locate_top(id) else {
+            return Vec::new();
+        };
         let mut path = Vec::new();
-        for s in self.all_layers().flat_map(|l| &l.shapes) {
-            if walk(s, id, &mut path) {
-                return path;
-            }
+        match self.nth_layer(k).and_then(|l| l.shapes.get(i)) {
+            Some(top) if walk(top, id, &mut path) => path,
+            _ => Vec::new(),
         }
-        Vec::new()
     }
 
     /// The object lies inside a group or a clip frame (not on a layer).
@@ -6565,20 +7676,8 @@ impl Document {
     /// The object on a layer that holds `id` (itself when it lies on a
     /// layer).
     pub fn top_level_of(&self, id: ShapeId) -> Option<ShapeId> {
-        fn holds(s: &Shape, id: ShapeId) -> bool {
-            s.id == id
-                || match &s.kind {
-                    ShapeKind::Group { children } => children.iter().any(|c| holds(c, id)),
-                    ShapeKind::ClipFrame { frame, contents } => {
-                        holds(frame, id) || contents.iter().any(|c| holds(c, id))
-                    }
-                    _ => false,
-                }
-        }
-        self.all_layers()
-            .flat_map(|l| &l.shapes)
-            .find(|s| holds(s, id))
-            .map(|s| s.id)
+        let (k, i) = self.locate_top(id)?;
+        self.nth_layer(k)?.shapes.get(i).map(|s| s.id)
     }
 
     /// Union of all shape bounds on a page, or None when the page is empty.
@@ -6721,7 +7820,16 @@ impl Document {
     /// further at each group inside a group, so a curve node took 0.5 to
     /// 1.3 KB and a drawing with many nodes in nested groups ran to
     /// hundreds of megabytes. Every reader takes either layout.
-    pub fn write_json_version<W: std::io::Write>(&self, w: W, version: u32) -> Result<()> {
+    pub fn write_json_version<W: std::io::Write>(&self, mut w: W, version: u32) -> Result<()> {
+        if self.nesting() <= SHALLOW_NESTING {
+            return self.write_json_here(w, version);
+        }
+        let json = self.deep_json(|d, buf| d.write_json_here(buf, version))?;
+        w.write_all(&json).map_err(serde_json::Error::io)?;
+        Ok(())
+    }
+
+    fn write_json_here<W: std::io::Write>(&self, w: W, version: u32) -> Result<()> {
         use crate::finite::{Finite, FiniteSerializer};
         if (version as usize) >= DOWN_STEPS.len() {
             #[derive(Serialize)]
@@ -6766,14 +7874,83 @@ impl Document {
             return self.write_json_version(w, version);
         }
         let mut gz = flate2::write::GzEncoder::new(w, flate2::Compression::new(TDRAW_GZIP_LEVEL));
-        self.write_packed(&mut gz)?;
+        if self.nesting() <= SHALLOW_NESTING {
+            self.write_packed_here(&mut gz)?;
+        } else {
+            let json = self.deep_json(|d, buf| d.write_packed_here(buf))?;
+            use std::io::Write as _;
+            gz.write_all(&json).map_err(serde_json::Error::io)?;
+        }
         gz.finish().map_err(serde_json::Error::io)?;
         Ok(())
     }
 
+    /// The JSON `write` makes of a deeply nested drawing (groups inside
+    /// groups past [`SHALLOW_NESTING`]), made on a thread with room for
+    /// it ([`on_deep_stack`]): any thread's stack has room for a shallow
+    /// one, not for a few thousand groups inside groups. A drawing nested
+    /// deeper than a file may be ([`MAX_JSON_DEPTH`]) is not written:
+    /// the error says so, instead of a file that would refuse to open.
+    fn deep_json(
+        &self,
+        write: impl FnOnce(&Document, &mut Vec<u8>) -> Result<()> + Send,
+    ) -> Result<Vec<u8>> {
+        let json = on_deep_stack(|| {
+            let mut buf = Vec::new();
+            write(self, &mut buf).map(|()| buf)
+        })?;
+        let depth = json_depth_of(&json);
+        if depth > MAX_JSON_DEPTH {
+            return Err(<serde_json::Error as serde::ser::Error>::custom(format!(
+                "the drawing nests {depth} levels deep (groups inside groups); a file holds at most {MAX_JSON_DEPTH}, so it would not open again: ungroup some of it"
+            ))
+            .into());
+        }
+        Ok(json)
+    }
+
+    /// How deep objects nest in the drawing: 1 for objects on a layer, one
+    /// more for each group or clip frame they are inside.
+    pub fn nesting(&self) -> usize {
+        let mut deepest = 0;
+        let mut stack: Vec<(&Shape, usize)> = Vec::new();
+        let layers = self
+            .pages
+            .iter()
+            .flat_map(|p| &p.layers)
+            .chain(&self.master);
+        for l in layers {
+            stack.extend(l.shapes.iter().map(|s| (s, 1)));
+        }
+        stack.extend(self.symbols.iter().map(|sym| (&sym.shape, 1)));
+        while let Some((s, d)) = stack.pop() {
+            deepest = deepest.max(d);
+            match &s.kind {
+                ShapeKind::Group { children } => {
+                    stack.extend(children.iter().map(|c| (c, d + 1)));
+                }
+                ShapeKind::ClipFrame { frame, contents } => {
+                    stack.push((frame, d + 1));
+                    stack.extend(contents.iter().map(|c| (c, d + 1)));
+                }
+                _ => {}
+            }
+        }
+        deepest
+    }
+
     /// The packed JSON of the current format, uncompressed: the drawing
     /// with references for its pictures and fonts, then their table.
-    pub fn write_packed<W: std::io::Write>(&self, w: W) -> Result<()> {
+    pub fn write_packed<W: std::io::Write>(&self, mut w: W) -> Result<()> {
+        if self.nesting() <= SHALLOW_NESTING {
+            return self.write_packed_here(w);
+        }
+        let json = self.deep_json(|d, buf| d.write_packed_here(buf))?;
+        w.write_all(&json).map_err(serde_json::Error::io)?;
+        Ok(())
+    }
+
+    fn write_packed_here<W: std::io::Write>(&self, w: W) -> Result<()> {
         use crate::finite::FiniteSerializer;
         #[derive(Serialize)]
         struct Packed<'a> {
@@ -6806,6 +7983,29 @@ impl Document {
     /// date by [`migrate`]; newer ones are read as far as this version
     /// knows them (fields it does not know are left out).
     pub fn from_json(s: &str) -> Result<Self> {
+        // Reading nests a few large stack frames per level of the file:
+        // a drawing of a couple of hundred nested groups, which the file
+        // may hold (MAX_JSON_DEPTH), overflowed the stack and ended the
+        // program. A deep file is read on a thread of its own with room.
+        if json_depth(s) > SHALLOW_JSON_DEPTH {
+            return on_deep_stack(|| Self::from_json_here(s));
+        }
+        Self::from_json_here(s)
+    }
+
+    fn from_json_here(s: &str) -> Result<Self> {
+        // Read straight from the text when it can be: every step of
+        // `migrate` keeps the layout, so a file of any version reads as
+        // it is. A drawing's JSON taken in as a value first held several
+        // times the text in memory: a 246 MB file with large drawings
+        // took more than 20 GB to open (#3833). A file that does not read
+        // this way (a number written as null, a wrong table) goes the
+        // long way below, which mends what it can or says what is wrong.
+        if STEPS_KEEP_LAYOUT {
+            if let Some(doc) = Self::from_json_text(s) {
+                return Ok(doc.opened());
+            }
+        }
         let mut v: serde_json::Value = json_value(s)?;
         let from = tdraw_version(&v);
         migrate(&mut v, from);
@@ -6825,14 +8025,44 @@ impl Document {
             }
         }
         let _table = crate::bytes::ReadingTable::start(blobs);
-        let mut doc: Document = match Document::deserialize(&v) {
+        let doc: Document = match Document::deserialize(&v) {
             Ok(doc) => doc,
             Err(e) => numbers_lost_as_zero(v, e)?,
         };
+        Ok(doc.opened())
+    }
+
+    /// The drawing `s` holds, read from the text without a JSON value in
+    /// between (#3833): first the table of pictures and fonts at its end
+    /// (the rest skipped over), then the drawing, its pictures looked up
+    /// in the table. `None` when the text does not read this way.
+    fn from_json_text(s: &str) -> Option<Self> {
+        if json_depth(s) > MAX_JSON_DEPTH {
+            return None;
+        }
+        #[derive(Deserialize)]
+        struct Table {
+            #[serde(default)]
+            blobs: Vec<String>,
+        }
+        let mut de = serde_json::Deserializer::from_str(s);
+        de.disable_recursion_limit();
+        let table = Table::deserialize(&mut de).ok()?;
+        let _table = crate::bytes::ReadingTable::start(table.blobs);
+        let mut de = serde_json::Deserializer::from_str(s);
+        de.disable_recursion_limit();
+        let doc = Document::deserialize(&mut de).ok()?;
+        de.end().ok()?;
+        Some(doc)
+    }
+
+    /// A drawing just read, with what a file does not save worked out.
+    fn opened(mut self) -> Self {
         // What text wraps around is not saved: work it out again.
-        doc.refresh_text_flow();
-        doc.refit_text_meshes();
-        Ok(doc)
+        self.refresh_text_flow();
+        self.refit_text_meshes();
+        self.break_symbol_loops();
+        self
     }
 
     /// Stretch the mesh fill of every text whose grid lies inside the
@@ -6871,13 +8101,43 @@ impl Document {
 }
 
 /// How many brackets (`{` and `[`) of a `.tdraw` file may be open at
-/// once. A group inside a group nests four levels, so this is some 250
-/// groups inside groups, far beyond what a drawing holds (the `.cdr`
-/// reader stops at 64) and read, migrated and drawn well within the
-/// stack of every platform. The JSON reader's own limit is 128 levels,
-/// about 30 groups inside groups, which drawings do reach: such a
-/// drawing saved and then refused to open, and was lost.
-pub const MAX_JSON_DEPTH: usize = 1024;
+/// once. A group inside a group nests three levels, so this is some
+/// 5,000 groups inside groups, read on a thread with room for it
+/// ([`DEEP_STACK`]). The JSON reader's own limit is 128 levels, about 30
+/// groups inside groups, which drawings do reach: such a drawing saved
+/// and then refused to open, and was lost. The limit was then 1024
+/// levels, some 330 groups inside groups, which the Group command goes
+/// past as easily: the drawing saved and would not open again. A drawing
+/// nested past this one is not saved (see `Document::deep_json`).
+pub const MAX_JSON_DEPTH: usize = 16384;
+
+/// Objects nested no deeper than this ([`Document::nesting`]) are
+/// written on the caller's thread: some 30 groups inside groups, within
+/// [`SHALLOW_JSON_DEPTH`].
+const SHALLOW_NESTING: usize = 30;
+
+/// JSON nested no deeper than this is read on the caller's thread; any
+/// thread's stack (1 MB at the least) has room for it.
+const SHALLOW_JSON_DEPTH: usize = 96;
+
+/// Stack for reading or writing a deeply nested drawing: room for
+/// [`MAX_JSON_DEPTH`] levels with plenty to spare (only the part used is
+/// ever taken from memory).
+const DEEP_STACK: usize = 512 * 1024 * 1024;
+
+/// `f` run on a thread of its own with a [`DEEP_STACK`], its result (or
+/// its panic) passed back.
+pub fn on_deep_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("deep-drawing".into())
+            .stack_size(DEEP_STACK)
+            .spawn_scoped(scope, f)
+            .expect("a thread to read a deeply nested drawing")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
 
 /// The JSON of a `.tdraw` text as a value, with the reader's nesting
 /// limit lifted and [`MAX_JSON_DEPTH`] in its place.
@@ -6900,10 +8160,15 @@ fn json_value(s: &str) -> Result<serde_json::Value> {
 /// once, brackets inside strings not counted. Text that is not JSON
 /// gives some number; the reader then says what is wrong with it.
 fn json_depth(s: &str) -> usize {
+    json_depth_of(s.as_bytes())
+}
+
+/// [`json_depth`] of JSON bytes.
+fn json_depth_of(s: &[u8]) -> usize {
     let (mut depth, mut deepest) = (0usize, 0usize);
     let mut in_string = false;
     let mut escaped = false;
-    for b in s.bytes() {
+    for &b in s {
         if in_string {
             match b {
                 _ if escaped => escaped = false,
@@ -7062,8 +8327,38 @@ pub fn tdraw_version(v: &serde_json::Value) -> u32 {
 }
 
 /// The version a `.tdraw` text says it has (0 for unreadable text).
+/// Only that number is read, the rest of the text skipped over: taking
+/// the whole drawing in as a JSON value for it held several times the
+/// text in memory just before the drawing was read (#3833).
 pub fn tdraw_text_version(s: &str) -> u32 {
-    json_value(s).map(|v| tdraw_version(&v)).unwrap_or(0)
+    #[derive(Deserialize)]
+    struct Version {
+        #[serde(default)]
+        format_version: Option<u64>,
+    }
+    let read = || {
+        let mut de = serde_json::Deserializer::from_str(s);
+        de.disable_recursion_limit();
+        Version::deserialize(&mut de).ok()
+    };
+    let version = if json_depth(s) > SHALLOW_JSON_DEPTH {
+        on_deep_stack(read)
+    } else {
+        read()
+    };
+    match version {
+        Some(Version {
+            format_version: Some(n),
+        }) => {
+            let n = if n == SAME_AS_ZERO { 0 } else { n };
+            n.min(u64::from(u32::MAX)) as u32
+        }
+        Some(Version {
+            format_version: None,
+        }) => 0,
+        // Not a whole number, or text that is not JSON: as before.
+        None => json_value(s).map(|v| tdraw_version(&v)).unwrap_or(0),
+    }
 }
 
 /// One step of [`migrate`]: the JSON of version `i` to version `i + 1`.
@@ -7079,6 +8374,11 @@ const STEPS: [Step; TDRAW_FORMAT_VERSION as usize] = [same_layout, same_layout];
 const DOWN_STEPS: [Step; TDRAW_FORMAT_VERSION as usize] = [same_layout, same_layout];
 
 fn same_layout(_: &mut serde_json::Value) {}
+
+/// Every one of [`STEPS`] is [`same_layout`], so `Document::from_json`
+/// reads a file of any version straight from its text. A step that
+/// changes the layout must set this to false.
+const STEPS_KEEP_LAYOUT: bool = true;
 
 /// The TraceDraw release that first wrote each `.tdraw` format version
 /// (`TDRAW_RELEASES[v]`), for Save As. Version 1 is not offered: it has
@@ -7152,6 +8452,203 @@ mod index_keys {
 
 #[cfg(test)]
 mod tests {
+    /// #3559: a curve's box is measured from its own segments, without
+    /// copying the curve; it is the box of the placed curve, turned,
+    /// slanted and inside a turned group too, and empty for no segments.
+    #[test]
+    fn a_curves_box_is_the_box_of_the_placed_curve() {
+        use super::{Shape, ShapeKind};
+        use crate::geometry::{Affine, BezPath, Rect, Shape as _};
+        let mut p = BezPath::new();
+        p.move_to((0.0, 0.0));
+        p.curve_to((10.0, 30.0), (40.0, -20.0), (50.0, 5.0));
+        p.quad_to((60.0, 40.0), (20.0, 30.0));
+        p.line_to((5.0, 12.0));
+        p.close_path();
+        p.move_to((70.0, 70.0));
+        p.line_to((80.0, 75.0));
+        let mut s = Shape::new(
+            crate::id::IdSource::default().shape(),
+            ShapeKind::Path {
+                path: p.clone(),
+                closed: false,
+            },
+        );
+        s.transform = Affine::translate((3.0, -7.0))
+            * Affine::rotate(0.7)
+            * Affine::new([1.0, 0.0, 0.4, 1.3, 0.0, 0.0]);
+        let close = |a: Rect, b: Rect| {
+            (a.x0 - b.x0).abs() < 1e-9
+                && (a.y0 - b.y0).abs() < 1e-9
+                && (a.x1 - b.x1).abs() < 1e-9
+                && (a.y1 - b.y1).abs() < 1e-9
+        };
+        let want = (s.transform * p.clone()).bounding_box();
+        assert!(close(s.bounds(), want), "{:?} {want:?}", s.bounds());
+        let mut g = Shape::new(
+            crate::id::IdSource::default().shape(),
+            ShapeKind::Group {
+                children: vec![s.clone()],
+            },
+        );
+        g.transform = Affine::rotate(-1.1) * Affine::scale(2.0);
+        let want = (g.transform * s.transform * p).bounding_box();
+        assert!(close(g.bounds(), want), "{:?} {want:?}", g.bounds());
+        s.kind = ShapeKind::Path {
+            path: BezPath::new(),
+            closed: false,
+        };
+        assert_eq!(s.bounds(), Rect::ZERO);
+    }
+
+    /// Objects are found by id from where the last one was found (a
+    /// selection of thousands was looked up one after the other, walking
+    /// the whole drawing for each): whatever the hint, including one left
+    /// stale by objects removed or moved to another page, a lookup finds
+    /// the right object, in groups too, and nothing for an id that is gone.
+    #[test]
+    fn objects_are_found_whatever_the_last_lookup_left() {
+        use super::{Document, Layer, Page, Shape, ShapeKind};
+        use crate::geometry::{Affine, Rect, Size};
+        let mut doc = Document::new("Find", Size::new(100.0, 100.0));
+        let mut ids = doc.ids().clone();
+        let rect = |ids: &mut crate::id::IdSource| {
+            Shape::new(
+                ids.shape(),
+                ShapeKind::Rect {
+                    rect: Rect::new(0.0, 0.0, 1.0, 1.0),
+                    radius: 0.0,
+                    corners: None,
+                },
+            )
+        };
+        let flat: Vec<Shape> = (0..50).map(|_| rect(&mut ids)).collect();
+        let flat_ids: Vec<_> = flat.iter().map(|s| s.id).collect();
+        let inner = rect(&mut ids);
+        let inner_id = inner.id;
+        let mut group = Shape::new(
+            ids.shape(),
+            ShapeKind::Group {
+                children: vec![inner],
+            },
+        );
+        group.transform = Affine::translate((5.0, 7.0));
+        let group_id = group.id;
+        doc.pages[0].layers[0].shapes = flat;
+        doc.pages.push(Page {
+            id: ids.page(),
+            name: "2".into(),
+            size: Size::new(100.0, 100.0),
+            layers: vec![Layer::new(ids.layer(), "L")],
+            guides: Vec::new(),
+            background: None,
+        });
+        doc.pages[1].layers[0].shapes.push(group);
+        doc.set_ids(ids);
+        // Forwards, backwards, and jumping about.
+        for &id in flat_ids.iter().chain(flat_ids.iter().rev()) {
+            assert_eq!(doc.find_shape(id).map(|s| s.id), Some(id));
+            assert_eq!(doc.shape(id).map(|(_, s)| s.id).ok(), Some(id));
+        }
+        for k in 0..50 {
+            let id = flat_ids[(k * 17) % 50];
+            assert_eq!(doc.locate(id).ok().map(|(_, i)| i), Some((k * 17) % 50));
+        }
+        // In a group on another page.
+        assert_eq!(doc.find_shape(inner_id).map(|s| s.id), Some(inner_id));
+        assert!(doc.shape(inner_id).is_err());
+        assert_eq!(doc.top_level_of(inner_id), Some(group_id));
+        assert_eq!(
+            doc.parent_transform(inner_id),
+            Some(Affine::translate((5.0, 7.0)))
+        );
+        // The hint left on the last object; objects before it removed,
+        // so everything shifts down, and the group moved to page 1.
+        assert!(doc.find_shape(flat_ids[49]).is_some());
+        doc.pages[0].layers[0].shapes.drain(0..10);
+        let moved = doc.pages[1].layers[0].shapes.remove(0);
+        doc.pages[0].layers[0].shapes.insert(3, moved);
+        assert_eq!(
+            doc.find_shape(flat_ids[49]).map(|s| s.id),
+            Some(flat_ids[49])
+        );
+        assert_eq!(doc.locate(flat_ids[49]).ok().map(|(_, i)| i), Some(40));
+        assert_eq!(doc.find_shape(inner_id).map(|s| s.id), Some(inner_id));
+        assert!(doc.find_shape(flat_ids[0]).is_none());
+        assert!(doc.find_shape_mut(flat_ids[5]).is_none());
+        doc.find_shape_mut(inner_id).expect("found to change").name = Some("x".into());
+        assert_eq!(
+            doc.find_shape(inner_id).and_then(|s| s.name.clone()),
+            Some("x".into())
+        );
+        // A hint is no part of the drawing.
+        let other = doc.clone();
+        assert!(doc.find_shape(flat_ids[20]).is_some());
+        assert_eq!(doc, other);
+    }
+
+    /// A drawing of more groups nested in one another than a thread's
+    /// stack had room for opens (it ended the program), one of 1,500
+    /// saves and opens again, and one nested past the most a file may
+    /// hold is not saved and says so.
+    #[test]
+    fn deeply_nested_groups_open() {
+        use super::{Document, Shape, ShapeKind, MAX_JSON_DEPTH};
+        use crate::geometry::{Rect, Size};
+        let nested = |depth: usize| {
+            let mut doc = Document::new("Deep", Size::new(100.0, 100.0));
+            let mut ids = doc.ids().clone();
+            let mut s = Shape::new(
+                ids.shape(),
+                ShapeKind::Rect {
+                    rect: Rect::new(0.0, 0.0, 1.0, 1.0),
+                    radius: 0.0,
+                    corners: None,
+                },
+            );
+            for _ in 0..depth {
+                s = Shape::new(ids.shape(), ShapeKind::Group { children: vec![s] });
+            }
+            doc.pages[0].layers[0].shapes.push(s);
+            doc.set_ids(ids);
+            doc
+        };
+        // Written and read on a small stack, as on any worker thread.
+        let small = |f: Box<dyn FnOnce() -> Option<usize> + Send>| {
+            std::thread::Builder::new()
+                .stack_size(1024 * 1024)
+                .spawn(f)
+                .unwrap()
+                .join()
+                .unwrap()
+        };
+        let doc = nested(300);
+        let json = small(Box::new(move || {
+            let json = doc.to_json().ok()?;
+            Document::from_json(&json).ok()?;
+            Some(json.len())
+        }));
+        assert!(json.is_some());
+        // A drawing of 1,500 groups inside groups, which the Group command
+        // makes, saves and opens again, packed too: past 330 or so it saved
+        // and would not open (the file nested past the 1024 levels read).
+        let doc = nested(1500);
+        let opened = small(Box::new(move || {
+            let mut packed = Vec::new();
+            doc.write_tdraw_version(&mut packed, super::TDRAW_FORMAT_VERSION)
+                .ok()?;
+            let back = Document::from_tdraw_bytes(&packed).ok()?;
+            Some(back.nesting())
+        }));
+        assert_eq!(opened, Some(1501));
+        // Nested past what a file holds: not written, and the error says why.
+        let doc = nested(MAX_JSON_DEPTH / 3 + 10);
+        let err = super::on_deep_stack(|| doc.to_json().expect_err("too deep").to_string());
+        assert!(err.contains("would not open again"), "{err}");
+        let mut packed = Vec::new();
+        assert!(doc.write_tdraw_version(&mut packed, 2).is_err());
+    }
+
     /// Bullet numbers (#1443): written as numbers, letters or Roman
     /// numerals; a run of numbered paragraphs counts on from its start
     /// and a paragraph without bullets ends it.
@@ -7183,6 +8680,75 @@ mod tests {
             (true, &num),
         ]);
         assert_eq!(n, vec![3, 4, 0, 3, 0, 3]);
+    }
+
+    /// List levels (#3685): each level counts on its own and starts again
+    /// under each paragraph above it; Restart starts again within a run,
+    /// Continue goes on after paragraphs without bullets; one level
+    /// deeper sets the bullet in and takes the next numbering or symbol.
+    #[test]
+    fn list_levels_number_on_their_own() {
+        use super::{bullet_numbers, BulletStyle, Numbering, MAX_LIST_LEVEL};
+        let top = BulletStyle {
+            numbering: Numbering::Arabic,
+            ..Default::default()
+        };
+        let sub = BulletStyle {
+            level: 1,
+            numbering: Numbering::LowerAlpha,
+            ..Default::default()
+        };
+        let restart = BulletStyle {
+            restart: true,
+            ..top.clone()
+        };
+        let cont = BulletStyle {
+            continue_list: true,
+            ..top.clone()
+        };
+        let n = bullet_numbers([
+            (true, &top),
+            (true, &sub),
+            (true, &sub),
+            (true, &top),
+            (true, &sub),
+            (true, &top),
+            (true, &restart),
+            (false, &top),
+            (true, &cont),
+            (false, &top),
+            (true, &top),
+        ]);
+        assert_eq!(n, vec![1, 1, 2, 2, 1, 3, 1, 0, 2, 0, 1]);
+        assert_eq!(sub.label("", 2), "b.");
+        // Set in by the level's indent, past the bullet's offset.
+        let deep = BulletStyle {
+            offset: 2.0,
+            level: 2,
+            level_indent: 5.0,
+            ..Default::default()
+        };
+        assert_eq!(deep.lead(), 12.0);
+        assert_eq!(BulletStyle::default().lead(), 0.0);
+        // Deeper and higher.
+        let mut b = top.clone();
+        let mut sym = String::from("1");
+        assert!(b.change_level(&mut sym, true));
+        assert_eq!((b.level, b.numbering), (1, Numbering::LowerAlpha));
+        assert!(b.change_level(&mut sym, true));
+        assert_eq!((b.level, b.numbering), (2, Numbering::LowerRoman));
+        assert!(b.change_level(&mut sym, false));
+        assert_eq!((b.level, b.numbering), (1, Numbering::LowerAlpha));
+        let mut s = BulletStyle::default();
+        let mut dot = String::from("\u{2022}");
+        assert!(s.change_level(&mut dot, true));
+        assert_eq!(dot, "\u{25E6}");
+        assert!(s.change_level(&mut dot, false));
+        assert_eq!(dot, "\u{2022}");
+        assert!(!s.change_level(&mut dot, false), "already at the top");
+        s.level = MAX_LIST_LEVEL;
+        assert!(!s.change_level(&mut dot, true), "already at the deepest");
+        assert!(!s.is_plain());
     }
 
     /// Columns of their own widths share the frame in proportion and
@@ -7249,6 +8815,383 @@ mod tests {
         assert_eq!(group.visual_bounds(), group.bounds());
         group.transform = Affine::translate((-20.0, 5.0));
         assert_eq!(group.bounds(), Rect::new(80.0, 305.0, 130.0, 315.0));
+    }
+
+    /// The box of groups nested deep takes each level's transformation
+    /// and is worked out without copying the members: each level copied
+    /// all of its members, so a drawing of a million objects in blocks
+    /// nested fifteen deep ran out of memory on opening.
+    #[test]
+    fn the_box_of_groups_nested_deep_is_quick_and_right() {
+        use crate::geometry::{Affine, Rect};
+        let square = |id: u64, x: f64| {
+            Shape::new(
+                ShapeId(id),
+                ShapeKind::Rect {
+                    rect: Rect::new(x, 0.0, x + 1.0, 1.0),
+                    radius: 0.0,
+                    corners: None,
+                },
+            )
+        };
+        let mut id = 0;
+        let mut inner = square(0, 0.0);
+        for _ in 0..200 {
+            let mut children: Vec<Shape> = (0..50)
+                .map(|i| {
+                    id += 1;
+                    square(id, f64::from(i))
+                })
+                .collect();
+            children.push(inner);
+            id += 1;
+            inner = Shape::new(ShapeId(id), ShapeKind::Group { children });
+            inner.transform = Affine::translate((1.0, 2.0));
+        }
+        let t = std::time::Instant::now();
+        let b = inner.bounds();
+        assert!(t.elapsed().as_secs() < 2, "{:?}", t.elapsed());
+        // The innermost row moved 200 times, the outermost once.
+        assert_eq!(b, Rect::new(1.0, 2.0, 250.0, 401.0));
+        // Scaled and turned levels compose as before.
+        let mut outer = Shape::new(
+            ShapeId(9_000),
+            ShapeKind::Group {
+                children: vec![square(9_001, 0.0)],
+            },
+        );
+        outer.transform = Affine::scale(2.0);
+        let mut top = Shape::new(
+            ShapeId(9_002),
+            ShapeKind::Group {
+                children: vec![outer],
+            },
+        );
+        top.transform =
+            Affine::translate((10.0, 0.0)) * Affine::rotate(std::f64::consts::FRAC_PI_2);
+        let b = top.bounds();
+        assert!(
+            (b.x0 - 8.0).abs() < 1e-9 && (b.x1 - 10.0).abs() < 1e-9,
+            "{b:?}"
+        );
+        assert!(
+            (b.y0 - 0.0).abs() < 1e-9 && (b.y1 - 2.0).abs() < 1e-9,
+            "{b:?}"
+        );
+    }
+
+    /// The quick box paths (`ShapeKind::known_box`,
+    /// `geometry::transformed_bounds`, `Shape::local_bounds`) give the
+    /// boxes the outline gives (#3559): snapping, picking and the
+    /// renderer's culling read a box for every object on every pointer
+    /// move and every render, and must see the same boxes as before.
+    #[test]
+    fn the_quick_box_matches_the_outlines_box() {
+        use crate::geometry::{Affine, BezPath, Rect};
+        let mut curve = BezPath::new();
+        curve.move_to((1.0, 2.0));
+        curve.curve_to((10.0, 20.0), (30.0, -5.0), (40.0, 8.0));
+        curve.line_to((5.0, 9.0));
+        curve.close_path();
+        let rect = Rect::new(0.0, 0.0, 10.0, 6.0);
+        let shapes: Vec<Shape> = vec![
+            Shape::new(
+                ShapeId(1),
+                ShapeKind::Rect {
+                    rect,
+                    radius: 0.0,
+                    corners: None,
+                },
+            ),
+            Shape::new(
+                ShapeId(2),
+                ShapeKind::Rect {
+                    rect,
+                    radius: 1.5,
+                    corners: None,
+                },
+            ),
+            Shape::new(
+                ShapeId(3),
+                ShapeKind::Rect {
+                    rect,
+                    radius: 0.0,
+                    corners: Some(Corners {
+                        radii: [1.0, 0.0, 2.0, 0.0],
+                        kind: CornerKind::Scallop,
+                        ..Corners::default()
+                    }),
+                },
+            ),
+            // A bowed edge reaches past the rect: no quick box (#2188).
+            Shape::new(
+                ShapeId(4),
+                ShapeKind::Rect {
+                    rect,
+                    radius: 0.0,
+                    corners: Some(Corners {
+                        bulge: [0.5, 0.0, 0.0, 0.0],
+                        ..Corners::default()
+                    }),
+                },
+            ),
+            Shape::new(ShapeId(5), ShapeKind::Ellipse { rect, arc: None }),
+            Shape::new(
+                ShapeId(6),
+                ShapeKind::Ellipse {
+                    rect,
+                    arc: Some(EllipseArc {
+                        start_deg: 10.0,
+                        end_deg: 250.0,
+                        pie: true,
+                        inner: 0.0,
+                    }),
+                },
+            ),
+            Shape::new(
+                ShapeId(7),
+                ShapeKind::Ellipse {
+                    rect,
+                    arc: Some(EllipseArc {
+                        start_deg: 10.0,
+                        end_deg: 250.0,
+                        pie: false,
+                        inner: 0.0,
+                    }),
+                },
+            ),
+            Shape::new(
+                ShapeId(8),
+                ShapeKind::Polygon {
+                    rect,
+                    points: 5,
+                    sharpness: 0.0,
+                    complex: None,
+                    twist: 0.0,
+                    bend: 0.0,
+                },
+            ),
+            Shape::new(
+                ShapeId(9),
+                ShapeKind::Polygon {
+                    rect,
+                    points: 7,
+                    sharpness: 0.5,
+                    complex: None,
+                    twist: 0.2,
+                    bend: 0.3,
+                },
+            ),
+            Shape::new(
+                ShapeId(10),
+                ShapeKind::Path {
+                    path: curve.clone(),
+                    closed: true,
+                },
+            ),
+            Shape::new(
+                ShapeId(11),
+                ShapeKind::Path {
+                    path: curve,
+                    closed: false,
+                },
+            ),
+            Shape::new(
+                ShapeId(12),
+                ShapeKind::Bitmap {
+                    rect,
+                    width_px: 2,
+                    height_px: 2,
+                    png: Vec::new().into(),
+                    fx: None,
+                },
+            ),
+            Shape::new(ShapeId(13), ShapeKind::SymbolInstance { index: 0 }),
+            Shape::new(
+                ShapeId(14),
+                ShapeKind::Table(Table {
+                    rect,
+                    col_widths: vec![5.0, 5.0],
+                    row_heights: vec![6.0],
+                    cells: Vec::new(),
+                    border: None,
+                    cell_fill: Fill::None,
+                    padding: 0.0,
+                    margins: None,
+                    spacing: None,
+                }),
+            ),
+        ];
+        // A clip frame's box is its frame's, a group's its members'.
+        let frame = shapes[0].clone();
+        let clip = Shape::new(
+            ShapeId(15),
+            ShapeKind::ClipFrame {
+                frame: Box::new(frame),
+                contents: Vec::new(),
+            },
+        );
+        let mut moved = shapes[9].clone();
+        moved.transform = Affine::translate((3.0, -2.0)) * Affine::rotate(0.4);
+        let group = Shape::new(
+            ShapeId(16),
+            ShapeKind::Group {
+                children: vec![shapes[0].clone(), moved],
+            },
+        );
+        let transforms = [
+            Affine::IDENTITY,
+            Affine::translate((17.0, -4.0)),
+            Affine::scale_non_uniform(2.0, 0.5),
+            Affine::scale(-1.0),
+            Affine::rotate(0.7),
+            Affine::skew(0.3, -0.1),
+            Affine::translate((5.0, 6.0)) * Affine::rotate(1.1) * Affine::scale_non_uniform(3.0, 0.25),
+        ];
+        for s in shapes.iter().chain([&clip, &group]) {
+            // The local box is the box of the local outline, up to the
+            // wobble of the outline's curve fitting (a rounded corner's
+            // outline starts a hair outside its own rectangle).
+            let from_outline = s.local_path().bounding_box();
+            let local = s.local_bounds();
+            assert!(
+                (local.x0 - from_outline.x0).abs() < 1e-9
+                    && (local.y0 - from_outline.y0).abs() < 1e-9
+                    && (local.x1 - from_outline.x1).abs() < 1e-9
+                    && (local.y1 - from_outline.y1).abs() < 1e-9,
+                "local box of {s:?}: {local:?} vs outline {from_outline:?}"
+            );
+            for t in transforms {
+                let mut m = s.clone();
+                m.transform = t * m.transform;
+                let from_outline = m.page_path().bounding_box();
+                let b = m.bounds();
+                assert!(
+                    (b.x0 - from_outline.x0).abs() < 1e-9
+                        && (b.y0 - from_outline.y0).abs() < 1e-9
+                        && (b.x1 - from_outline.x1).abs() < 1e-9
+                        && (b.y1 - from_outline.y1).abs() < 1e-9,
+                    "{:?} under {t:?}: {b:?} vs outline {from_outline:?}",
+                    s.kind
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn page_numbers_skip_the_last_pages_and_listed_pages_without_counting_them() {
+        let f = PageNumberField {
+            first_page: 2,
+            skip_last: 1,
+            skip: "4-5".into(),
+            ..Default::default()
+        };
+        let labels: Vec<String> = (0..8).map(|i| f.label_in(i, 8)).collect();
+        assert_eq!(labels, ["", "1", "2", "", "", "3", "4", ""]);
+        assert!(!f.numbers_in(7, 8) && f.numbers_in(6, 8));
+        // Saved before: no pages skipped.
+        let old: PageNumberField =
+            serde_json::from_str(r#"{"start_at":1,"first_page":1,"style":0}"#).unwrap();
+        assert_eq!(old, PageNumberField::default());
+        assert_eq!(old.label_in(4, 5), "5");
+    }
+
+    /// Round numbers map exactly: the quick box is bit-for-bit the
+    /// rectangle the shape was given, where the outline's curve fitting
+    /// wobbles by a hair under a move (#3559).
+    #[test]
+    fn the_quick_box_is_exact_on_whole_numbers() {
+        use crate::geometry::{Affine, Rect};
+        let mut s = Shape::new(
+            ShapeId(1),
+            ShapeKind::Ellipse {
+                rect: Rect::new(0.0, 0.0, 10.0, 6.0),
+                arc: None,
+            },
+        );
+        for (t, want) in [
+            (Affine::IDENTITY, Rect::new(0.0, 0.0, 10.0, 6.0)),
+            (Affine::translate((17.0, -4.0)), Rect::new(17.0, -4.0, 27.0, 2.0)),
+            (Affine::scale_non_uniform(2.0, 0.5), Rect::new(0.0, 0.0, 20.0, 3.0)),
+            (Affine::scale(-1.0), Rect::new(-10.0, -6.0, 0.0, 0.0)),
+        ] {
+            s.transform = t;
+            let b = s.bounds();
+            assert_eq!(b, want, "{t:?}");
+            // The outline's own box stays within a hair of it.
+            let from_outline = s.page_path().bounding_box();
+            assert!(
+                (b.x0 - from_outline.x0).abs() < 1e-9
+                    && (b.y0 - from_outline.y0).abs() < 1e-9
+                    && (b.x1 - from_outline.x1).abs() < 1e-9
+                    && (b.y1 - from_outline.y1).abs() < 1e-9,
+                "{t:?}: {b:?} vs outline {from_outline:?}"
+            );
+        }
+    }
+
+    /// The cost of [`Shape::bounds`] against the way it was found before
+    /// (build the page outline, then box it) on a drawing's worth of
+    /// shapes: run with `cargo test --release -p tracedraw-core --
+    /// --ignored bounds_cost --nocapture` (#3559).
+    #[test]
+    #[ignore]
+    fn bounds_cost_against_the_outline_way() {
+        use crate::geometry::{Affine, BezPath, Rect};
+        let mut curve = BezPath::new();
+        curve.move_to((0.0, 0.0));
+        for i in 1..40 {
+            let x = f64::from(i);
+            curve.curve_to((x, 2.0), (x + 0.3, -2.0), (x + 1.0, 0.0));
+        }
+        let mut shapes = Vec::new();
+        for i in 0..80_000u64 {
+            let mut s = match i % 3 {
+                0 => Shape::new(
+                    ShapeId(i),
+                    ShapeKind::Rect {
+                        rect: Rect::new(0.0, 0.0, 10.0, 6.0),
+                        radius: 1.5,
+                        corners: None,
+                    },
+                ),
+                1 => Shape::new(
+                    ShapeId(i),
+                    ShapeKind::Ellipse {
+                        rect: Rect::new(0.0, 0.0, 10.0, 6.0),
+                        arc: None,
+                    },
+                ),
+                _ => Shape::new(
+                    ShapeId(i),
+                    ShapeKind::Path {
+                        path: curve.clone(),
+                        closed: false,
+                    },
+                ),
+            };
+            s.transform = Affine::translate((f64::from(i as u32) * 0.01, 3.0))
+                * Affine::scale_non_uniform(1.5, 0.75);
+            shapes.push(s);
+        }
+        let t = std::time::Instant::now();
+        let mut area = 0.0;
+        for s in &shapes {
+            let b = s.bounds();
+            area += b.width() * b.height();
+        }
+        let quick = t.elapsed();
+        let t = std::time::Instant::now();
+        let mut area2 = 0.0;
+        for s in &shapes {
+            let b = s.page_path().bounding_box();
+            area2 += b.width() * b.height();
+        }
+        let outline = t.elapsed();
+        eprintln!(
+            "80k shapes: bounds() {quick:?}, page_path().bounding_box() {outline:?} ({:.1}x), areas {area:.3} {area2:.3}",
+            outline.as_secs_f64() / quick.as_secs_f64().max(1e-9)
+        );
     }
 
     #[test]
@@ -7596,6 +9539,50 @@ mod tests {
             deep.len(),
             flat.len()
         );
+    }
+
+    /// An open arc converted to curves stays an open curve, so its
+    /// arrowheads stay; it came out closed, without them (#2983).
+    #[test]
+    fn an_open_arc_converted_to_curves_keeps_its_arrowheads() {
+        let mut arc = Shape::new(
+            ShapeId(1),
+            ShapeKind::Ellipse {
+                rect: Rect::new(0.0, 0.0, 40.0, 30.0),
+                arc: Some(EllipseArc {
+                    start_deg: 0.0,
+                    end_deg: 200.0,
+                    pie: false,
+                    inner: 0.0,
+                }),
+            },
+        );
+        let mut st = crate::style::Stroke::new(crate::Color::BLACK, 1.0);
+        st.end_arrow = crate::style::Arrowhead::Arrow;
+        arc.stroke = Some(st.clone());
+        let heads = crate::style::arrowhead_paths(&arc.page_path(), &st).len();
+        assert_eq!(heads, 1);
+        let got = arc
+            .converted_to_curves(&[], &mut || ShapeId(2))
+            .expect("converted");
+        assert!(
+            matches!(got.kind, ShapeKind::Path { closed: false, .. }),
+            "{:?}",
+            got.kind
+        );
+        assert_eq!(
+            crate::style::arrowhead_paths(&got.page_path(), &st).len(),
+            heads
+        );
+        // A pie stays closed.
+        let mut pie = arc.clone();
+        if let ShapeKind::Ellipse { arc: Some(a), .. } = &mut pie.kind {
+            a.pie = true;
+        }
+        let got = pie
+            .converted_to_curves(&[], &mut || ShapeId(3))
+            .expect("pie");
+        assert!(matches!(got.kind, ShapeKind::Path { closed: true, .. }));
     }
 
     /// Variable font axis values (#870) are set, replaced and taken off
@@ -7950,6 +9937,55 @@ mod tests {
         assert!(matches!(children[0].kind, ShapeKind::Path { .. }));
     }
 
+    /// A further fill's look of its own: its part gets the live effects
+    /// that draw it, after the object's own; the other parts stay plain.
+    /// Set Extra Paint keeps the looks with as many fills as there are.
+    #[test]
+    fn a_further_fill_has_a_look_of_its_own() {
+        use crate::Color;
+        let mut s = Shape::new(
+            ShapeId(1),
+            ShapeKind::Rect {
+                rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+                radius: 0.0,
+                corners: None,
+            },
+        );
+        s.stroke = None;
+        s.extra_fills = vec![Fill::Solid(Color::BLACK), Fill::Solid(Color::WHITE)];
+        let look = FillLook {
+            grow: 2.0,
+            move_x: 1.0,
+            move_y: 0.0,
+            blur: 0.5,
+        };
+        s.fill_looks = Some(Box::new(vec![look]));
+        assert!(FillLook::default().effects().is_empty());
+        let parts = s.layers().expect("parts");
+        assert_eq!(parts.len(), 3);
+        assert!(parts[0].effects.is_empty() && parts[2].effects.is_empty());
+        assert_eq!(parts[1].effects, look.effects());
+        assert_eq!(parts[1].effects.len(), 3);
+        assert!(parts.iter().all(|p| p.fill_looks.is_none()));
+        // Saved and read back.
+        let back: Shape = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.fill_look(0), look);
+        assert!(back.fill_look(1).is_plain());
+        // Fewer fills: the looks go with them; none left plain stays None.
+        let mut doc = Document::new("t", crate::geometry::Size::new(50.0, 50.0));
+        let layer = doc.pages[0].layers[0].id;
+        doc.pages[0].layers[0].shapes.push(s.clone());
+        crate::Command::SetExtraPaint {
+            shapes: vec![s.id],
+            fills: vec![],
+            strokes: vec![],
+            looks: None,
+        }
+        .apply(&mut doc)
+        .unwrap();
+        assert!(doc.layer(layer).unwrap().shapes[0].fill_looks.is_none());
+    }
+
     #[test]
     fn further_fills_and_outlines_draw_in_layers() {
         use crate::{Color, Stroke};
@@ -8042,6 +10078,53 @@ mod tests {
         p
     }
 
+    #[test]
+    fn tdraw_files_read_straight_from_their_text() {
+        // A drawing reads from its text without a JSON value in between,
+        // packed or plain, to the drawing the long way gives; the long way
+        // stays for what only it mends (#3833).
+        let mut doc = Document::new("Straight", crate::geometry::Size::new(100.0, 50.0));
+        let layer = doc.pages[0].layers[0].id;
+        for i in 0..3 {
+            let id = doc.ids_mut().shape();
+            let mut path = BezPath::new();
+            path.move_to((f64::from(i), 1.5));
+            path.curve_to((2.25, 3.0), (4.0, 5.125), (6.0, 7.0));
+            let s = Shape::new(
+                id,
+                ShapeKind::Path {
+                    path,
+                    closed: i % 2 == 0,
+                },
+            );
+            doc.layer_mut(layer).expect("layer").shapes.push(s);
+        }
+        let mut packed = Vec::new();
+        doc.write_tdraw_version(&mut packed, TDRAW_FORMAT_VERSION)
+            .expect("write");
+        for text in [
+            tdraw_text(&packed).expect("text"),
+            doc.to_json_version(0).expect("plain"),
+        ] {
+            let straight = Document::from_json_text(&text).expect("straight");
+            assert_eq!(straight.opened(), doc);
+            assert_eq!(Document::from_json(&text).expect("reads"), doc);
+        }
+        // The version alone is read the short way too, as the long way
+        // reads it.
+        assert_eq!(tdraw_text_version(&tdraw_text(&packed).expect("text")), TDRAW_FORMAT_VERSION);
+        assert_eq!(tdraw_text_version(&doc.to_json_version(0).expect("plain")), 0);
+        assert_eq!(tdraw_text_version("{\"format_version\": 1}"), 0);
+        assert_eq!(tdraw_text_version("{\"format_version\": 2.5}"), 0);
+        assert_eq!(tdraw_text_version("not json"), 0);
+        // A number lost as null reads only the long way, as 0.
+        let text = doc.to_json_version(0).expect("plain");
+        let lost = text.replacen("1.5", "null", 1);
+        assert!(Document::from_json_text(&lost).is_none());
+        let back = Document::from_json(&lost).expect("mended");
+        assert_eq!(back.pages[0].layers[0].shapes.len(), 3);
+    }
+
     /// A saved drawing is packed (#2849): each distinct picture and font
     /// once however many objects hold it, the whole JSON gzip-compressed;
     /// it reads back the same, with the copies sharing one buffer again.
@@ -8098,6 +10181,8 @@ mod tests {
         let table: serde_json::Value = serde_json::from_str(&text).expect("json");
         assert_eq!(table[BLOBS_KEY].as_array().map(Vec::len), Some(2));
         assert_eq!(tdraw_text_version(&text), TDRAW_FORMAT_VERSION);
+        // Read straight from the text, with the table (#3833).
+        assert!(Document::from_json_text(&text).is_some());
         let back = Document::from_tdraw_bytes(&packed).expect("reads");
         let pictures: Vec<&crate::SharedBytes> = back.pages[0].layers[0]
             .shapes
@@ -8332,6 +10417,7 @@ mod tests {
             style: GuideStyle::Dotted,
             locked: true,
             hidden: true,
+            name: Some("Fold".into()),
         };
         let json = serde_json::to_string(&g).unwrap();
         assert!(json.contains("\"dir\":\"vertical\""));
@@ -9077,6 +11163,7 @@ mod tests {
             sharpness: 0.0,
             complex: Some(3),
             twist: 0.0,
+            bend: 0.0,
         };
         let back: ShapeKind = serde_json::from_str(&serde_json::to_string(&k).unwrap()).unwrap();
         assert_eq!(back, k);
@@ -9088,6 +11175,7 @@ mod tests {
             sharpness: 0.4,
             complex: None,
             twist: 0.25,
+            bend: 0.0,
         };
         let json = serde_json::to_string(&twisted).unwrap();
         assert!(json.contains("twist"));
@@ -9101,6 +11189,7 @@ mod tests {
             sharpness: -0.3,
             complex: None,
             twist: 0.0,
+            bend: 0.0,
         };
         let json = serde_json::to_string(&inverted).unwrap();
         assert!(json.contains("\"sharpness\":-0.3"), "{json}");
@@ -9247,6 +11336,30 @@ mod tests {
         assert!(!plain.contains("direction"), "{plain}");
     }
 
+    /// Kashida (#3827): older files read as off, which is not written;
+    /// a setting is saved, read back and carried by a paragraph format.
+    #[test]
+    fn kashida_defaults_to_off_and_round_trips() {
+        let old: ParagraphStyle = serde_json::from_str("{}").expect("parses");
+        assert_eq!(old.kashida, Kashida::Off);
+        let json = serde_json::to_string(&old).expect("writes");
+        assert!(!json.contains("kashida"), "{json}");
+        let mut k = old.clone();
+        k.kashida = Kashida::Medium;
+        let json = serde_json::to_string(&k).expect("writes");
+        assert!(json.contains("\"kashida\":\"medium\""), "{json}");
+        let back: ParagraphStyle = serde_json::from_str(&json).expect("parses");
+        assert_eq!(back.kashida, Kashida::Medium);
+        let f = crate::ParagraphFormat::of(TextAlign::Justify, &k);
+        let json = serde_json::to_string(&f).expect("writes");
+        let back: crate::ParagraphFormat = serde_json::from_str(&json).expect("parses");
+        let mut p = ParagraphStyle::default();
+        back.apply_to(&mut p);
+        assert_eq!(p.kashida, Kashida::Medium);
+        let plain = serde_json::to_string(&crate::ParagraphFormat::default()).expect("writes");
+        assert!(!plain.contains("kashida"), "{plain}");
+    }
+
     /// The column order of vertical text (#1986): older files read as
     /// right to left, left to right is saved and read back, and such a
     /// frame's text is placed from its top left.
@@ -9329,6 +11442,126 @@ mod tests {
         assert!(
             shown.contains("Press") && shown.contains("bytes: 4"),
             "{shown}"
+        );
+    }
+
+    #[test]
+    fn symbols_drawing_themselves_or_trillions_open_mended() {
+        let inst =
+            |id: u64, index: usize| Shape::new(ShapeId(id), ShapeKind::SymbolInstance { index });
+        let group = |children: Vec<Shape>| Shape::new(ShapeId(0), ShapeKind::Group { children });
+        let sym = |shape: Shape| Symbol {
+            name: "s".into(),
+            shape,
+        };
+        let empty =
+            |s: &Shape| matches!(&s.kind, ShapeKind::Group { children } if children.is_empty());
+        // 0 draws itself; 1 and 2 draw each other (the loop is cut where
+        // it closes, in 2); 2 also draws 0, which stays; 3 draws 2.
+        let mut doc = Document {
+            symbols: vec![
+                sym(group(vec![inst(1, 0)])),
+                sym(inst(2, 2)),
+                sym(group(vec![inst(3, 1), inst(4, 0)])),
+                sym(inst(5, 2)),
+            ],
+            ..Default::default()
+        };
+        doc.pages[0].layers[0].shapes = vec![inst(9, 3)];
+        let back = Document::from_json(&doc.to_json().expect("json")).expect("load");
+        let ShapeKind::Group { children } = &back.symbols[0].shape.kind else {
+            panic!()
+        };
+        assert!(empty(&children[0]));
+        assert!(matches!(
+            back.symbols[1].shape.kind,
+            ShapeKind::SymbolInstance { index: 2 }
+        ));
+        let ShapeKind::Group { children } = &back.symbols[2].shape.kind else {
+            panic!()
+        };
+        assert!(empty(&children[0]));
+        assert!(matches!(
+            children[1].kind,
+            ShapeKind::SymbolInstance { index: 0 }
+        ));
+        assert!(matches!(
+            back.symbols[3].shape.kind,
+            ShapeKind::SymbolInstance { index: 2 }
+        ));
+        assert_eq!(
+            back.pages[0].layers[0].shapes,
+            doc.pages[0].layers[0].shapes
+        );
+
+        // Each symbol draws the one before twice: 2^40 objects.
+        let mut bomb = Document::default();
+        bomb.symbols.push(sym(group(Vec::new())));
+        for i in 1..40 {
+            bomb.symbols
+                .push(sym(group(vec![inst(1, i - 1), inst(2, i - 1)])));
+        }
+        bomb.break_symbol_loops();
+        let kept = |s: &Symbol| match &s.shape.kind {
+            ShapeKind::Group { children } => children.iter().all(|c| !empty(c)),
+            _ => true,
+        };
+        // Symbol k stands for about 2^(k+2) objects: 18 is the first past
+        // a million, so 19 loses its instances of it, and 20 draws the
+        // little left of 19.
+        assert!(bomb.symbols[..19].iter().all(kept));
+        assert!(!kept(&bomb.symbols[19]));
+        assert!(kept(&bomb.symbols[20]));
+    }
+
+    #[test]
+    fn symbol_visual_bounds_cover_off_origin_and_nested_definitions() {
+        // A definition far from the origin (as .cdr definitions sit around
+        // the page centre), and a second symbol that places two copies of it.
+        let leaf = Shape::new(
+            ShapeId(0),
+            ShapeKind::Rect {
+                rect: Rect::new(120.0, 160.0, 150.0, 180.0),
+                radius: 0.0,
+                corners: None,
+            },
+        );
+        let mut a = Shape::new(ShapeId(1), ShapeKind::SymbolInstance { index: 0 });
+        a.transform = Affine::IDENTITY;
+        let mut b = Shape::new(ShapeId(2), ShapeKind::SymbolInstance { index: 0 });
+        b.transform = Affine::translate((40.0, -10.0));
+        let outer = Shape::new(
+            ShapeId(0),
+            ShapeKind::Group {
+                children: vec![a.clone(), b],
+            },
+        );
+        let symbols = vec![
+            Symbol {
+                name: "Leaf".into(),
+                shape: leaf,
+            },
+            Symbol {
+                name: "Pair".into(),
+                shape: outer,
+            },
+        ];
+        let r0 = a.visual_bounds_with(&symbols);
+        assert!(
+            (r0.x0 - 120.0).abs() < 1e-6
+                && (r0.y0 - 160.0).abs() < 1e-6
+                && (r0.x1 - 150.0).abs() < 1e-6
+                && (r0.y1 - 180.0).abs() < 1e-6,
+            "{r0:?}"
+        );
+        let inst_outer = Shape::new(ShapeId(3), ShapeKind::SymbolInstance { index: 1 });
+        let r1 = inst_outer.visual_bounds_with(&symbols);
+        assert!(
+            (r1.x0 - 120.0).abs() < 1e-6
+                && (r1.y0 - 150.0).abs() < 1e-6
+                && (r1.x1 - 190.0).abs() < 1e-6
+                && (r1.y1 - 180.0).abs() < 1e-6,
+            "{r1:?}"
         );
     }
 
@@ -9440,6 +11673,60 @@ mod tests {
             },
         );
         assert!(rect.text_parts().is_none());
+    }
+
+    /// A bullet of its own colour (#3682) is drawn in a part of its own,
+    /// which draws no characters, and the characters' part leaves it out.
+    #[test]
+    fn bullets_of_their_own_colour_are_a_part_of_their_own() {
+        use crate::color::Color;
+        let red = Color::rgb8(255, 0, 0);
+        let para = ParagraphStyle {
+            bullets: true,
+            bullet: BulletStyle {
+                color: Some(red),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut shape = Shape::new(
+            ShapeId(1),
+            ShapeKind::Text {
+                spans: vec![TextSpan::new("ab", "Arial", 12.0)],
+                origin: Point::ZERO,
+                frame: None,
+                align: Default::default(),
+                para,
+                on_path: None,
+            },
+        );
+        shape.fill = Fill::Solid(Color::BLACK);
+        let parts = shape.text_parts().expect("parts");
+        assert_eq!(parts.len(), 2);
+        let part = |p: &Shape| match &p.kind {
+            ShapeKind::Text { spans, para, .. } => {
+                (spans.iter().all(|s| s.layout_only), para.bullet_part)
+            }
+            _ => panic!("text"),
+        };
+        assert_eq!(part(&parts[0]), (false, Some(BulletPart::Text)));
+        assert_eq!(parts[0].fill, Fill::Solid(Color::BLACK));
+        assert_eq!(part(&parts[1]), (true, Some(BulletPart::Color(red))));
+        assert_eq!(parts[1].fill, Fill::Solid(red));
+        assert!(parts.iter().all(|p| p.text_parts().is_none()));
+        assert!(!BulletPart::draws(Some(BulletPart::Text), Some(red), true));
+        assert!(BulletPart::draws(Some(BulletPart::Text), None, true));
+        assert!(BulletPart::draws(
+            Some(BulletPart::Color(red)),
+            Some(red),
+            false
+        ));
+        assert!(BulletPart::draws(None, Some(red), true));
+        // Without a colour of its own the text is drawn whole.
+        if let ShapeKind::Text { para, .. } = &mut shape.kind {
+            para.bullet.color = None;
+        }
+        assert!(shape.text_parts().is_none());
     }
 
     #[test]
@@ -9683,5 +11970,53 @@ mod tests {
             on_path: None,
         };
         assert!(s.text_parts().is_none());
+    }
+
+    /// The layer of a number is reached by counting pages, not layers
+    /// (each lookup of an object walked every layer before its own,
+    /// which made filling a print merge of thousands of pages slow): the
+    /// same layer as walking them all, master layers first, on pages
+    /// with any number of layers, and none past the last.
+    #[test]
+    fn a_layer_is_reached_by_its_number_without_walking_the_others() {
+        let mut doc = Document::new("d", crate::geometry::Size::new(100.0, 100.0));
+        for name in ["m1", "m2"] {
+            let id = doc.ids_mut().layer();
+            doc.master.push(Layer::new(id, name));
+        }
+        for extra in [0usize, 3, 0, 1, 2] {
+            let id = doc.ids_mut().page();
+            let mut page = doc.pages[0].clone();
+            page.id = id;
+            page.layers.clear();
+            for _ in 0..extra {
+                let l = doc.ids_mut().layer();
+                page.layers.push(Layer::new(l, "L"));
+            }
+            doc.pages.push(page);
+        }
+        let all: Vec<LayerId> = doc.all_layers().map(|l| l.id).collect();
+        assert_eq!(all.len(), 2 + 1 + 6);
+        for (k, id) in all.iter().enumerate() {
+            assert_eq!(doc.nth_layer(k).map(|l| l.id), Some(*id), "layer {k}");
+            assert_eq!(doc.nth_layer_mut(k).map(|l| l.id), Some(*id), "layer {k}");
+        }
+        assert!(doc.nth_layer(all.len()).is_none());
+        assert!(doc.nth_layer_mut(all.len() + 7).is_none());
+        // An object on the last page's last layer is found, and changed,
+        // where it is.
+        let shape = doc.ids_mut().shape();
+        let last = *all.last().expect("layers");
+        doc.layer_mut(last).expect("layer").shapes.push(Shape::new(
+            shape,
+            ShapeKind::Rect {
+                rect: crate::geometry::Rect::new(0.0, 0.0, 1.0, 1.0),
+                radius: 0.0,
+                corners: None,
+            },
+        ));
+        assert_eq!(doc.locate(shape).expect("found"), (last, 0));
+        doc.shape_mut(shape).expect("found").name = Some("x".into());
+        assert_eq!(doc.find_shape(shape).and_then(|s| s.name.clone()).as_deref(), Some("x"));
     }
 }

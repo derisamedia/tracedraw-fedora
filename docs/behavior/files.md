@@ -5,6 +5,36 @@ has none (new, or opened from a format TraceDraw only reads or converts,
 `.cdr` included), and File > Save As (Ctrl+Shift+S), open the Save
 Drawing dialog.
 
+A save never loses the file it replaces (`files::replace_with`): the new
+file is written whole under a `.part` name beside it first, and only
+then copied over the old one in place (keeping its permissions, links
+and an open drawing's hold on it) and the `.part` file removed. When the
+write fails half way (a full disk, an error while the drawing is
+written, the program stopped), the old file is as it was; it was
+written over from the start and left cut short, so both the old and the
+new drawing were lost. Should the copy into place fail, the `.part` file
+keeps the whole new file and the error on the status line names it. A
+new file is the `.part` file renamed. Exports and every other file the
+desktop writes go the same way (`files::tests::a_failed_write_keeps_the_file_it_was_replacing`).
+
+A large `.tdraw` drawing saved from the File menu, the toolbar, Ctrl+S,
+Ctrl+Shift+S or the Save Drawing dialog is written off the interface's
+thread (`saving::Saving`, #4011): one whose file is already 2 MB or
+more, or with 10 000 objects or more on its layers
+(`saving::is_large`). The status line says "Saving <file>…" and, when it
+takes more than 0.4 seconds, a window "Saving <name>" shows how many
+megabytes are written with a moving bar, so the program never stands
+still with nothing on screen during a long save. Until the file is
+written the drawing counts as unsaved and what is typed, clicked or
+dropped is held back (`saving::hold_input`; the window can be moved and
+closed: closing waits for the file). Then it is saved as after any
+save: the status line, the recent files, the thumbnail. A drawing
+changed meanwhile (a macro, an agent) keeps its unsaved changes. Small
+drawings, `.cdr` files, the browser, and saves that something waits for
+(the question on closing a drawing, macros, packages) are written at
+once, as before (`documents::tests::a_large_drawing_is_saved_off_the_interfaces_thread`,
+`saving::tests::a_drawing_is_written_on_a_worker_with_its_bytes_counted`).
+
 ## Save Drawing
 
 One window, 760 px wide, the same on every system:
@@ -118,6 +148,20 @@ One window, 760 px wide, the same on every system:
 - In the browser, where every save is a download, the dialog keeps the
   file name, type, version and properties, and says the browser saves
   the file in its downloads folder.
+- Options > General > Use the system's save dialog (off by default on
+  every system; not in the browser or on Android, #2965): Save
+  As, and Save of a drawing without a file, open the system's own save
+  dialog instead, in the folder and with the name the Save Drawing
+  dialog would offer, with TraceDraw and CorelDRAW as its types (the
+  drawing's own first). The extension chosen there sets the type, the
+  versions are the ones Options sets, the system asks before replacing a
+  file, and Cancel saves nothing
+  (`ui::save_as::tests::the_system_save_dialog_saves_in_the_type_chosen_there`).
+  It was on by default on macOS, where the system's dialog shows no type
+  list, so Save As offered no way to choose `.cdr` or its version
+  (#3811): it is off by default now, and preferences that had it on are
+  set back to the Save Drawing dialog once (upgrade 9); turned on again
+  it stays (`settings::tests::save_as_offers_the_type_and_version_by_default`).
 
 ## `.cdr` versions
 
@@ -151,6 +195,11 @@ version decides who can open a file:
 
 What each version's file holds is in `docs/cdr-format.md`, Writing.
 
+Layers keep their state from version 16: a hidden layer is saved
+hidden with its objects, and a locked layer or one kept from printing
+keeps that, as the program's own files hold them. Before version 16 a
+hidden layer is saved empty.
+
 Live effects and drop shadows are saved as what they draw (a distorted
 rectangle as its curve, a contour as its steps, a shadow as a picture
 of it beneath the object), which any program shows. From version 14
@@ -163,6 +212,25 @@ between opens as it was drawn. The objects themselves are kept whole in
 pictures and the end objects of its blends included), so the member grows
 with them; a member that inflates past 64 MB is not read, and its
 objects open as drawn.
+
+What the writer cannot write yet goes out with stand-ins any program
+shows: a pattern, texture, PostScript or mesh fill as one colour, a
+fountain with repeats, inversion, the shaped kind, midpoints or free
+nodes as the nearest plain fountain, an outline fill as the outline
+colour, and a line's arrowheads as curves of their own just above it,
+filled with the outline colour. From version 14 the same member keeps
+these objects as they were, so opened again in TraceDraw the fill, the
+arrowheads, the outline fill and overprint are all back; files of
+versions 7 to 13 open with the stand-ins.
+
+The document palette (with the names its colours go by), the spot inks,
+the colour styles and the object styles have no record written yet
+either, nor has the object style an object follows. From version 14
+the file carries them in members of its own (`tracedraw/document.json`,
+and the object's style in `tracedraw/data.json`), so opened again in
+TraceDraw they are all back and a spot colour names its ink again;
+other programs do not see them, and files of versions 7 to 13 lose
+them. A palette or ink the file itself gives wins over the member's.
 
 ## Open drawings keep their files (Windows, #2130)
 
@@ -189,8 +257,29 @@ The open drawings are compared with the holds once a frame (paths only);
 a file is opened only when a drawing was opened, closed or saved under
 another name.
 
+## Combine Files and Save Pages as Files (#3358)
+
+- File > Combine Files... picks one or more drawings (`.tdraw`, `.cdr`,
+  `.cdt`, `.cdrt`, `.cmx`) and adds every page of each, in the order
+  picked, after the last page of the open drawing: the page's name and
+  size, and its objects (the objects of all its layers, in their order, on
+  one layer named as its first). The symbols those objects show come
+  along, carried fonts too, and imported colours follow the colour
+  management policy of File > Import. All of it is one undo step; the
+  first page added becomes the current page and the status bar says how
+  many pages came from how many files. A file that cannot be read is left
+  out and named on the status bar.
+- File > Save Pages as Files... asks for a file name and saves each page
+  as a TraceDraw drawing beside it, named after it with the page number
+  (`Poster-1.tdraw`, `Poster-2.tdraw`). Each holds that page with its
+  layers, guides and background, and what the drawing keeps for all its
+  pages (symbols, styles, colours, inks, fonts). The open drawing stays as
+  it was, unsaved changes and all.
+- `combine_files::tests::pages_saved_as_files_combine_back`
+
 ## Checks
 
+- `files::tests::a_failed_write_keeps_the_file_it_was_replacing`
 - Each open drawing's file is held from the frame after it is opened or
   saved until it is closed or saved under another name, in the front tab
   or another, the file a drawing was opened from until it is saved under

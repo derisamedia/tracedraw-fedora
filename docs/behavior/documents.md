@@ -30,6 +30,8 @@ rulers:
   never holds the window; a missing file shows neither. A narrower
   window and a phone keep the list of name over folder
   (`ui::welcome::tests::the_recent_documents_are_a_table_with_size_and_date`).
+  The table and its scroll bar stop 24 points short of the window's right
+  edge, as far as the New and Open buttons stand from its left (#2867).
 - The Welcome Screen tab has a close button on hover (a middle click
   also closes it): the tab shrinks to its house alone (a 26 px square,
   the title as its tip) and the active drawing shows. With no drawing
@@ -79,6 +81,28 @@ the browser build does not look (uploads of one name are different
 files). Window > New Window gives a second window on an open drawing
 (`documents::tests::opening_an_open_file_again_shows_its_tab`,
 `templates_always_open_a_new_drawing`).
+
+File > Revert (on while the drawing has unsaved changes) reads again
+the drawing's own file, or the `.cdr`, `.svg`, `.pdf` or other file it
+was read from (#3809: such a drawing has no file of its own, so that
+Save asks where, and Revert stayed off for it). The drawing read again
+takes the changed one's place in its tab, the changes dropped, unless
+the drawing has another window open or is read off the interface's
+thread (a large `.tdraw`): then it opens in a tab of its own
+(`documents::tests::revert_reads_a_cdr_again_in_its_own_tab`).
+
+A large file of another format (8 MB or more: a `.cdr`, a PDF, an SVG,
+a PostScript file) is read on the interface's thread, which stops the
+window until the drawing is there. It says so first: the status line
+shows "Opening <file>…" and a window "Opening <name>" with "Reading the
+file… The window does not answer until the drawing is open." is on
+screen for a frame before the reading starts (`App::open_notice`,
+`App::poll_open_notice`); several files chosen at once open one after
+the other, each with its notice. Before, the program stood still from
+the moment the file was chosen with nothing saying why. A large
+`.tdraw` is read off the interface's thread with a bar and Cancel
+(`opening::Opening`); Revert reads at once
+(`documents::tests::a_large_file_of_another_format_says_it_is_opening_first`).
 
 Closing a tab
 (File > Close, Ctrl+F4, the tab's close button) asks to save unsaved

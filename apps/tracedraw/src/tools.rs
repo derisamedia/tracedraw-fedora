@@ -34,6 +34,7 @@ pub enum Tool {
     Bezier,
     Pen,
     BSpline,
+    CurvaturePen,
     Polyline,
     ThreePointCurve,
     // Drawing group
@@ -55,6 +56,7 @@ pub enum Tool {
     ActionLines,
     Balloon,
     GraphPaper,
+    ShapeGenerator,
     // Text group
     Text,
     Table,
@@ -138,6 +140,7 @@ pub const GROUPS: &[ToolGroup] = &[
             Tool::Bezier,
             Tool::Pen,
             Tool::BSpline,
+            Tool::CurvaturePen,
             Tool::Polyline,
             Tool::ThreePointCurve,
         ],
@@ -175,6 +178,7 @@ pub const GROUPS: &[ToolGroup] = &[
             Tool::ActionLines,
             Tool::Balloon,
             Tool::GraphPaper,
+            Tool::ShapeGenerator,
         ],
         hidden: false,
     },
@@ -233,7 +237,7 @@ pub const GROUPS: &[ToolGroup] = &[
 ];
 
 impl Tool {
-    pub const ALL: [Tool; 68] = [
+    pub const ALL: [Tool; 70] = [
         Tool::Pick,
         Tool::FreeformPick,
         Tool::FreeTransform,
@@ -258,6 +262,7 @@ impl Tool {
         Tool::Bezier,
         Tool::Pen,
         Tool::BSpline,
+        Tool::CurvaturePen,
         Tool::Polyline,
         Tool::ThreePointCurve,
         Tool::BrushStrokes,
@@ -275,6 +280,7 @@ impl Tool {
         Tool::ActionLines,
         Tool::Balloon,
         Tool::GraphPaper,
+        Tool::ShapeGenerator,
         Tool::Text,
         Tool::Table,
         Tool::ParallelDimension,
@@ -331,6 +337,7 @@ impl Tool {
             Tool::Bezier => "bezier",
             Tool::Pen => "pen",
             Tool::BSpline => "bspline",
+            Tool::CurvaturePen => "curvature_pen",
             Tool::Polyline => "polyline",
             Tool::ThreePointCurve => "three_point_curve",
             Tool::BrushStrokes => "brush_strokes",
@@ -348,6 +355,7 @@ impl Tool {
             Tool::ActionLines => "action_lines",
             Tool::Balloon => "balloon",
             Tool::GraphPaper => "graph_paper",
+            Tool::ShapeGenerator => "shape_generator",
             Tool::Text => "text",
             Tool::Table => "table",
             Tool::ParallelDimension => "parallel_dimension",
@@ -410,10 +418,6 @@ impl Tool {
             Tool::OutlineColor => "Shift+F12",
             _ => return None,
         })
-    }
-
-    pub fn shortcut_label(self) -> &'static str {
-        self.shortcut().unwrap_or("")
     }
 
     /// Parse a shortcut label like "Shift+F12" into (key, shift).
@@ -525,6 +529,7 @@ impl Tool {
                 | Tool::Polygon
                 | Tool::Star
                 | Tool::GraphPaper
+                | Tool::ShapeGenerator
                 | Tool::ActionLines
                 | Tool::Balloon
         )
@@ -532,7 +537,8 @@ impl Tool {
 
     /// Drawing tools whose drag from a handle of the selection resizes it
     /// instead of starting a new shape (the handles show right after a
-    /// shape is drawn).
+    /// shape is drawn). The Text tool too, so a text just typed or a
+    /// frame just drawn resizes without going to the Pick tool (#3258).
     pub fn resizes_by_handles(self) -> bool {
         self.is_box_tool()
             || matches!(
@@ -541,6 +547,7 @@ impl Tool {
                     | Tool::ThreePointEllipse
                     | Tool::Spiral
                     | Tool::CommonShapes
+                    | Tool::Text
             )
     }
 

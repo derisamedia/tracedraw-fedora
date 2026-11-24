@@ -3,13 +3,16 @@
 ## Resample {#resample}
 
 [[menu.bitmaps > menu.bitmaps.resample]] gives the selected bitmaps a new
-number of pixels; their size on the page stays.
+number of pixels and, if you want, a new size on the page.
 
 ![The Resample dialog box](../../img/bitmaps-resample-and-straighten-resample.png)
 
 1. Type the new size in **pixels**, as a **percent**, or as the
    **resolution** it gives at its size on the page. With **Maintain aspect
    ratio** on, the height follows the width.
+   To change the size on the page, type it under **Size on page** in the
+   **Units** you choose, or pick this page or a paper under **Fit to**:
+   the resolution stays and the pixels follow.
 2. Choose the method:
    - **Smooth** (photos), at first;
    - **Sharp**, a little crisper;
@@ -60,6 +63,7 @@ Some effects, such as blurs, spread past the edges of a bitmap.
 - [[menu.bitmaps.crop_bitmap]] crops a bitmap with the [[tool.crop]] tool;
   dragging a corner of a bitmap with the [[tool.shape]] tool crops it too.
 - [[menu.bitmaps.edit_bitmap]] opens the bitmap in another program.
+- [[menu.bitmaps.edit_inside]] (or a double click on the picture with the Pick tool) opens it in the image editing mode, the whole window an image editor with its own menus, tools with icons, bars and panels, zoom and pan: selections, brush, soft eraser, clone, heal, blur, content fill, red eye, layers with opacity, merge modes and masks, quick mask, stretch and warp, restore, tint and replace colour brushes, pixel shapes, liquify, Smart Resize, adjustment layers, a histogram, a remove brush, a brush and a stamp that follow the surface of the photo, and any bitmap effect inside the selection only. Enter finishes, as one undo step.
 - [[menu.bitmaps.remove_background_local]] makes the background of a photo
   transparent on this computer (see
   [Removing the background](remove-background.md));

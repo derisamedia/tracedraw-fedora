@@ -37,6 +37,24 @@ with the last trace's settings, no dialog), Open Last Trace Settings
 presets; a bitmap's right-click menu has the same (#452, `ops2::tests::the_last_trace_can_be_repeated_and_reopened`).
 The last trace is kept for the session.
 
+### Progress window
+
+Automatic, Repeat Last Trace and the dialog's OK (when its preview has
+not traced every selected picture already) trace off the interface
+thread (`trace_job.rs`), so the program keeps answering while a trace
+runs (an enlarged picture with Best optimization and small print can take
+many seconds). A window (`ui/trace_progress.rs`) shows the turning busy
+mark, the step the trace is at (Enlarging the picture, Choosing the best
+detail, Finding the colors, Drawing the curves, Checking against the
+picture, Matching the letters), "Picture 2 of 3" when several bitmaps
+are traced, a bar with the percentage and the time taken. The steps
+report through the trace's cancel flag (`trace_progress.rs`); the bar
+counts only the steps the trace takes, weighted by about how long each
+takes. Cancel, Esc and the close button stop the trace and place
+nothing. When every picture is traced the window closes and the curves
+are placed as one undo step, as before. The browser traces in the frame
+(`trace_job::tests`, `trace_progress::tests`).
+
 ## The dialog
 
 A window the user sizes (1040 x 700 points at first, never under 780 x
@@ -345,9 +363,17 @@ can be undone.
    a colour found in another's holes (with no page showing in the hole)
    above it, the head under its eyes and cheeks; among the colours free
    to go next the darkest; colours in each other's holes (black eyes in
-   a yellow head inside a black outline) darkest first. Unless Remove
-   object overlap is on, every hole of a region (4-connected) that holds
-   only regions stacked above it is filled: the region is drawn whole
+   a yellow head inside a black outline) darkest first, unless one of
+   them holds at least four times as many pixels of the other as the
+   other holds of it: that one is the one around. A few blots of the
+   ground left between two colours of the art (a compressed picture, the
+   blend at a thin gap) no longer put the ground over the outline it
+   holds, where the two would meet cut to the same edge with the page
+   showing between them as a light line (#3727). A hole smaller than
+   half a pixel of the art is no hole. Unless Remove
+   object overlap is on, every hole of a region (4-connected) whose
+   regions stacked below it cover at most one part in twenty of it is
+   filled (those blots go under it, hidden): the region is drawn whole
    under them, so its curve is its outline alone and the edges inside
    are drawn once, by the regions on top (a black outline drawing
    becomes one silhouette under its colours, a head one ring under its

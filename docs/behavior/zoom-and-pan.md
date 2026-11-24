@@ -27,6 +27,11 @@
   toolbox button keeps it until another tool is chosen. Shift+F2 zooms
   to the selection; F4 zooms to fit
   all objects; Shift+F4 zooms to the page.
+- View > Zoom 1:1 shows the drawing at its real size, the zoom box's
+  100 % (Options > Zoom/Pan's calibration counts). It has no key at
+  first; Options > Customization > Commands gives it one, Ctrl+1 for
+  instance (#3103,
+  `pick_drag_tests::field_focus_tests::zoom_1to1_takes_a_key_and_shows_the_real_size`).
 - These keys work while a text is being edited too, and the editing
   goes on: after F2's one zoom the text is edited on where it was
   (#1699, `pick_drag_tests::zoom_keys_work_while_editing_text`).
@@ -40,9 +45,16 @@
 
 - Default (Options > Tools > Default action for mouse wheel: Zoom): the
   wheel zooms by the zoom step per notch about the pointer, in a glide
-  over a few frames, not in one jump; Ctrl+wheel scrolls vertically;
-  Alt+wheel scrolls horizontally (#766,
-  `pick_drag_tests::a_wheel_notch_zooms_in_a_glide`).
+  over a few frames, not in one jump (#766,
+  `pick_drag_tests::a_wheel_notch_zooms_in_a_glide`). Ctrl+wheel and
+  Shift+wheel scroll horizontally; Alt+wheel scrolls vertically. A
+  touchpad's fine steps or a pinch with Ctrl held still zoom (#3087,
+  `pick_drag_tests::ctrl_and_shift_wheel_scroll_sideways_alt_wheel_up_and_down`).
+  Options > Tools > Zoom/Pan > Ctrl+wheel zooms (off at first,
+  `settings.ctrl_wheel_zooms`) makes Ctrl+wheel zoom about the pointer as
+  the plain wheel does, for those used to zooming that way (#3473,
+  `pick_drag_tests::ctrl_wheel_zooms_when_the_option_is_ticked`); it
+  applies only while the wheel zooms.
 - Zoom step (Options > Tools > Zoom/Pan > Zoom per wheel notch, #895):
   1 to 100 %, 15 % at first (a factor of 1.15 a notch). A notch is a line of the
   wheel on the desktop, three lines or 100 pixels in the browser
@@ -68,11 +80,37 @@
   for slow computers. A notch zooms its whole step at once, without the
   glide, and the canvas keeps the last picture scaled while the zoom
   goes on, drawing the drawing anew once the view has rested 0.3 s
-  (`raster::LIGHT_SETTLE_SECONDS`) instead of starting a render at every
-  step. A three-notch wheel turn with the glide starts 6 renders (each
-  frame of the glide gives up the last one); with Light zoom, 1
+  (`raster::LIGHT_SETTLE_SECONDS`), for the zoom the wheel stopped at
   (`raster::tests::light_zoom_renders_once_when_the_zoom_stops`,
   `pick_drag_tests::light_zoom_draws_once_per_wheel_turn`).
+  A turn of one notch starts 1 render with the glide, 1 with Light
+  zoom. With the glide the picture on the way is drawn for the
+  view the glide lands at (`raster::zoom_target`, from
+  `ZoomGlide::target_view`), not for the zoom the frames are passing
+  through: the turn's render is not spent on a zoom the glide has
+  already passed, and when the glide ends the view is put at that same
+  view (`ZoomGlide::land`), the picture fitting the landing to the bit
+  (`view_motion::tests::the_glide_lands_on_the_view_it_was_aimed_at`,
+  `raster::tests::the_picture_of_a_glide_is_drawn_for_the_view_it_lands_at`).
+  A pan while the glide goes folds the glide's aim into the panned
+  view, the point the pan put under the anchor staying there
+  (`view_motion::tests::a_pan_while_the_glide_goes_folds_into_its_landing`).
+  The first step of a zoom renders at once; the steps after it are
+  skipped while that render is on its way, the running render keeping
+  its turn
+  (`raster::tests::the_latest_zoom_wins_without_restarting_renders`),
+  and when it is done, for a zoom the view has already left, the next
+  render starts at once, for the view the glide lands at then, or,
+  without the glide, the zoom the view is at, the turn not left
+  idle for the wheel to rest
+  (`raster::tests::a_zoom_burst_skips_steps_until_the_view_settles`).
+  A render still on its way when the wheel has rested is asked to give
+  up at its next object, after a wait that follows the wheel's own
+  pace: one and a half the gap between the last two notches, at the
+  least 0.04 s (`raster::ZOOM_SETTLE_MIN`), at most 0.12 s
+  (`raster::SETTLE_SECONDS`), so a wheel that has stopped is told from
+  one that goes on a few frames later, and a slow turn's render lands
+  between the notches.
 - With the Scroll setting: the wheel scrolls vertically; Shift+wheel
   scrolls horizontally; Ctrl+wheel zooms.
 - A trackpad pinch zooms by the gesture's factor with either setting.
@@ -151,6 +189,23 @@
   the view there (and follows the pointer while held) and its release
   closes the pop-up; a press anywhere else or Esc closes it. Check:
   `ui::window_bars::tests::view_navigator_has_the_key_n`.
+
+## Progressive preview memory
+
+The desktop canvas assembles completed render bands directly into one
+output picture. Finished bands are released after their preview callback;
+they do not accumulate into another whole picture before assembly. The
+assembly lock is released before the callback, so a slow consumer does
+not hold up workers copying other bands. Cancellation discards the
+incomplete output and never returns it as a finished picture (#3883).
+
+This reduces temporary band storage; it does not cap image decoding,
+effect buffers, or the interface's queued texture uploads. The synthetic
+`progressive_memory::progressive_assembly_does_not_retain_a_second_picture`
+regression measures live allocations, checks the pixels, and exercises
+cancellation before rendering and from a preview callback. Run that test
+binary alone on at least two CPUs, preferably in a memory-limited
+container.
 
 ## Checks
 

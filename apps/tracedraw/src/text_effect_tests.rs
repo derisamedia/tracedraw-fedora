@@ -929,7 +929,7 @@ fn the_blend_tool_s_end_squares_move_and_pick_the_end_objects() {
 
 /// Copy Envelope Properties from a shape with no envelope fits the text
 /// into that shape (#993): text taking a circle's outline takes the
-/// circle's shape and size where the text is, as in CorelDRAW (#2178),
+/// circle's shape and size where the text is (#2178),
 /// and leaves the corners of its box empty.
 #[test]
 fn text_takes_the_shape_of_an_object_as_its_envelope() {
@@ -970,4 +970,137 @@ fn text_takes_the_shape_of_an_object_as_its_envelope() {
         }
     });
     assert!(worst < 1.02, "{worst}");
+}
+
+/// Convert to Curves on a paragraph text whose words have colours of
+/// their own: a group of curves, one a colour, each with its colour and
+/// only its own words; the whole stays one undo step. All came out in the
+/// object's fill (#3107).
+#[test]
+fn multicoloured_paragraph_text_converts_to_curves_in_its_colours() {
+    tracedraw_text::install();
+    let mut app = App::headless();
+    let red = Fill::Solid(Color::rgb8(220, 0, 0));
+    let green = Fill::Solid(Color::rgb8(0, 160, 0));
+    let blue = Fill::Solid(Color::rgb8(0, 0, 200));
+    let mut a = tracedraw_core::TextSpan::new("Red words ", "DejaVu Sans", 24.0);
+    a.fill = Some(red.clone());
+    let b = tracedraw_core::TextSpan::new("plain ", "DejaVu Sans", 24.0);
+    let mut c = tracedraw_core::TextSpan::new("green", "DejaVu Sans", 24.0);
+    c.fill = Some(green.clone());
+    let id = app.engine.new_shape_id();
+    let mut s = tracedraw_core::Shape::new(
+        id,
+        ShapeKind::Text {
+            spans: vec![a, b, c],
+            origin: Point::new(20.0, 20.0),
+            frame: Some(tracedraw_core::geometry::Size::new(150.0, 80.0)),
+            align: tracedraw_core::document::TextAlign::Left,
+            para: Default::default(),
+            on_path: None,
+        },
+    );
+    s.fill = blue.clone();
+    let layer = app.doc().pages[0].layers[0].id;
+    app.run(tracedraw_core::Command::AddShape { layer, shape: s });
+    let whole = app
+        .doc()
+        .find_shape(id)
+        .expect("text")
+        .page_path()
+        .bounding_box();
+    app.select(vec![id]);
+    let rev = app.engine.revision();
+    app.convert_to_curves();
+    assert_eq!(app.engine.revision(), rev + 1);
+    let out = app.doc().find_shape(id).expect("converted").clone();
+    let ShapeKind::Group { children } = &out.kind else {
+        panic!("a group of curves: {:?}", out.kind);
+    };
+    let fills: Vec<&Fill> = children.iter().map(|c| &c.fill).collect();
+    assert_eq!(fills, vec![&red, &blue, &green]);
+    for (i, c) in children.iter().enumerate() {
+        assert!(matches!(c.kind, ShapeKind::Path { .. }), "{i}");
+        let bb = c.bounds();
+        assert!(
+            bb.width() > 1.0 && bb.area() < whole.area() * 0.8,
+            "{i}: {bb:?}"
+        );
+    }
+    assert!(
+        near_rect(out.bounds(), whole, 0.5),
+        "{:?} {whole:?}",
+        out.bounds()
+    );
+    // Undo gives the text back.
+    app.undo();
+    assert!(matches!(
+        app.doc().find_shape(id).expect("text").kind,
+        ShapeKind::Text { .. }
+    ));
+}
+
+/// #3763: Break Apart on a text frame gives one artistic text per line
+/// as the frame lays it out, drawn where the line was; Combine on texts
+/// makes one text again (still text, not curves), lines in reading order.
+#[test]
+fn break_apart_and_combine_keep_frame_text_as_text() {
+    tracedraw_text::install();
+    let mut app = App::headless();
+    app.start_text(Point::new(20.0, 100.0), Some(tracedraw_core::geometry::Size::new(80.0, 60.0)));
+    app.text_insert("first line\nsecond line");
+    let id = app.text_edit.as_ref().expect("editing").shape;
+    app.finish_text();
+    let before = app.doc().find_shape(id).expect("frame").bounds();
+    app.select(vec![id]);
+    app.break_apart();
+    let texts = |app: &App| -> Vec<(String, Point, bool)> {
+        app.selection
+            .iter()
+            .filter_map(|id| app.doc().find_shape(*id))
+            .filter_map(|s| match &s.kind {
+                ShapeKind::Text { spans, origin, frame, .. } => {
+                    Some((spans_text(spans), *origin, frame.is_none()))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let got = texts(&app);
+    assert_eq!(
+        got.iter().map(|t| t.0.as_str()).collect::<Vec<_>>(),
+        ["first line", "second line"],
+        "{got:?}"
+    );
+    assert!(got.iter().all(|t| t.2), "artistic text");
+    assert!(got[1].1.y < got[0].1.y, "{got:?}");
+    // The lines stay where the frame drew them.
+    let first = app.doc().find_shape(id).expect("first").bounds();
+    assert!((first.x0 - before.x0).abs() < 1.0, "{first:?} {before:?}");
+    assert!(first.y1 <= before.y1 + 0.5 && first.y0 >= before.y0 - 0.5);
+    // Combine: one text, still text, the lines in order.
+    let pieces = app.selection.clone();
+    app.combine();
+    assert_eq!(app.selection.len(), 1);
+    let one = app.doc().find_shape(app.selection[0]).expect("combined");
+    assert!(
+        matches!(&one.kind, ShapeKind::Text { spans, frame: None, .. } if spans_text(spans) == "first line\nsecond line"),
+        "{:?}",
+        one.kind
+    );
+    assert_eq!(pieces.iter().filter(|p| app.doc().find_shape(**p).is_some()).count(), 1);
+    // Words on one line join with a space.
+    app.break_apart();
+    let line = app.selection[0];
+    app.select(vec![line]);
+    app.break_apart();
+    assert_eq!(texts(&app).len(), 2);
+    app.combine();
+    let joined = app.doc().find_shape(app.selection[0]).expect("joined");
+    assert!(
+        matches!(&joined.kind, ShapeKind::Text { spans, .. } if spans_text(spans) == "first line"),
+        "{:?}",
+        joined.kind
+    );
+    assert_eq!(app.engine.undo_label(), Some("Combine"));
 }

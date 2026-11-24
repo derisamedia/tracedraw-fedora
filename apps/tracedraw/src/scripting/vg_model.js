@@ -387,6 +387,11 @@ class Transparency {
 
 class __Geo {
   _b() { return __call('vg_bounds', { ids: this._ids() }); }
+  // The dimensions among these objects: their label's size in points,
+  // and any setting of their style by the name it is saved with (#4026).
+  get LabelSize() { const ids = this._ids(); const s = ids.length ? __call('dimension_style', { id: ids[0] }) : null; return s ? s.text_size : 0; }
+  set LabelSize(v) { this.SetDimensionStyle({ text_size: Number(v) }); }
+  SetDimensionStyle(style) { return __call('set_dimension_style', { ids: this._ids(), style: style }).count; }
   _rp(ref) { return __refPoint(this._b(), ref); }
   get PositionX() { return __un(this._rp()[0]); }
   get PositionY() { return __un(this._rp()[1]); }
@@ -791,6 +796,11 @@ class __Story {
   set Italic(v) { this._spans(s => { s.italic = !!v; }); }
   get Underline() { const s = this.k.spans[0]; return s && s.underline ? cdrSingleThinFontLine : cdrNoFontLine; }
   set Underline(v) { this._spans(s => { s.underline = !!v; }); }
+  // The characters' background (#3518): a uniform colour, Nothing for
+  // none.
+  get BackgroundColor() { const s = this.k.spans[0]; const b = s && s.background; return b && b.fill === 'solid' ? new Color(__plain(b)) : null; }
+  set BackgroundColor(c) { const b = c ? Object.assign({ fill: 'solid' }, c.v) : null; this._spans(s => { s.background = b; }); }
+  ApplyNoBackground() { this.BackgroundColor = null; }
   get Alignment() { const a = __align2cdr[this.k.align]; return a === undefined ? cdrLeftAlignment : a; }
   set Alignment(v) { const k = this.k; k.align = __cdr2align[v] || 'left'; this.put(k); }
   get Length() { return this.Text.length; }
@@ -1121,6 +1131,11 @@ class Layer {
     }
     return new Shape(__call('create_dimension', { layer: this.id, kind: kind, x1: a[0], y1: a[1], x2: b[0], y2: b[1], tx: t[0], ty: t[1] }).id);
   }
+  // The same with the points as numbers, as the Scripts panel names
+  // them (#3517): the dimension line passes through (TextX, TextY).
+  CreateHorizontalDimension(x1, y1, x2, y2, TextX, TextY) { return this.CreateLinearDimension(0, [x1, y1], [x2, y2], true, TextX, TextY); }
+  CreateVerticalDimension(x1, y1, x2, y2, TextX, TextY) { return this.CreateLinearDimension(1, [x1, y1], [x2, y2], true, TextX, TextY); }
+  CreateParallelDimension(x1, y1, x2, y2, TextX, TextY) { return this.CreateLinearDimension(2, [x1, y1], [x2, y2], true, TextX, TextY); }
   // The angle at Center from Point1 to Point2, its arc through (TextX,
   // TextY) (else at three quarters of the shorter arm).
   CreateAngularDimension(Center, Point1, Point2, TextX, TextY) {
@@ -1338,7 +1353,7 @@ class __Documents {
   [Symbol.iterator]() { return __iter([new Document()]); }
 }
 class __Window {
-  get ActiveView() { return { Zoom: 100, SetViewArea() { }, ToFitPage() { }, ToFitSelection() { } }; }
+  get ActiveView() { return new __View(); }
   Refresh() { }
   Activate() { }
 }
@@ -1376,6 +1391,12 @@ const Application = {
   // The layer new objects go on; there is no virtual layer apart (#2165).
   get ActiveVirtualLayer() { return new Document().ActiveLayer; },
   get ActiveWindow() { return new __Window(); },
+  // Zoom To Fit, Zoom To Page, Zoom To Selection and Copy Visible Area,
+  // as the program's own scripts call them (#4020).
+  ZoomToFit() { new __View().ToFitAllObjects(); },
+  ZoomToPage() { new __View().ToFitPage(); },
+  ZoomToSelection() { new __View().ToFitSelection(); },
+  CopyVisibleArea() { new __View().CopyVisibleArea(); },
   // The installed font families, by name (#2165).
   get FontList() { return __fontList(); },
   get Documents() { return new __Documents(); },
@@ -1480,9 +1501,12 @@ class __View {
   set Type(v) { __call('vg_view', { simulate_overprints: v === cdrEnhancedViewWithOverprints }); }
   SetViewPoint() { }
   SetViewArea() { }
-  ToFitPage() { }
-  ToFitSelection() { }
-  ToFitAllObjects() { }
+  // Zoom To Page, Zoom To Selection and Zoom To Fit (#4020).
+  ToFitPage() { __call('view_step', { step: 'fit_page' }); }
+  ToFitSelection() { __call('view_step', { step: 'fit_selection' }); }
+  ToFitAllObjects() { __call('view_step', { step: 'fit_all' }); }
+  // Edit > Copy Visible Area: the window's view on the clipboard.
+  CopyVisibleArea() { __call('view_step', { step: 'copy_visible_area' }); }
   Activate() { }
 }
 __def(__Window, 'ActiveView', function () { return new __View(); });
@@ -1781,8 +1805,43 @@ Shape.prototype.OrderIsInFrontOf = function (Shape) {
   const a = __call('vg_zorder', { id: this.id }).rank, b = __call('vg_zorder', { id: __ids(Shape)[0] }).rank;
   return a > b;
 };
-Shape.prototype.AddToClipFrame = function (Shape) { __call('vg_place_inside', { ids: [this.id], frame: __ids(Shape)[0] }); };
-ShapeRange.prototype.AddToClipFrame = function (Shape) { __call('vg_place_inside', { ids: this._ids(), frame: __ids(Shape)[0] }); };
+// Into a clip frame: `Shape` becomes the frame (or takes more contents);
+// CenterInContainer true centres the contents on it first, otherwise they
+// stay where they are.
+function __toClipFrame(ids, Shape, CenterInContainer) {
+  const frame = __ids(Shape)[0];
+  if (frame === undefined) throw new Error('AddToClipFrame needs a shape to be the frame');
+  if (ids.length && (CenterInContainer === true || CenterInContainer === cdrTrue)) {
+    const b = __call('vg_bounds', { ids: ids }), f = __call('vg_bounds', { ids: [frame] });
+    const dx = (f.x0 + f.x1) / 2 - (b.x0 + b.x1) / 2, dy = (f.y0 + f.y1) / 2 - (b.y0 + b.y1) / 2;
+    if (dx || dy) __xf(ids, __M.move(dx, dy));
+  }
+  __call('vg_place_inside', { ids: ids, frame: frame });
+}
+Shape.prototype.AddToClipFrame = function (Shape, CenterInContainer) { __toClipFrame([this.id], Shape, CenterInContainer); };
+ShapeRange.prototype.AddToClipFrame = function (Shape, CenterInContainer) { __toClipFrame(this._ids(), Shape, CenterInContainer); };
+
+// Other names macros call members by (#2968: a macro that puts each
+// object into its own clip frame stopped with error 438). The names are
+// other programs' own, which this repository does not write (AGENTS.md
+// rule 3), so they are known by the FNV-1a hash of their lowercase
+// spelling: a member the object lacks, whose name hashes to an entry
+// here, is the member the entry names.
+function __nameHash(name) {
+  let h = 0x811c9dc5;
+  const s = String(name).toLowerCase();
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i) & 0xff;
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h;
+}
+const __memberAliases = new Map([
+  [2263586344, 'AddToClipFrame'],
+  [2726451344, 'ClipFrame'],
+  [3631069424, 'ClipFrameParent'],
+]);
+globalThis.__member_alias = function (name) { return __memberAliases.get(__nameHash(name)); };
 for (const cls of [Shapes, ShapeRange]) {
   cls.prototype.FindAnyOfType = function (...Types) {
     const list = cls === Shapes ? this._list : this._ids();

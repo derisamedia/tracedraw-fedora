@@ -12,8 +12,14 @@ pub mod camera;
 pub mod color;
 pub mod creative;
 pub mod distort;
+pub mod glitch;
+pub mod light;
 pub mod noise;
+pub mod paint;
 pub mod preview;
+pub mod print;
+pub mod sketch;
+pub mod strokes;
 pub mod texture;
 pub mod util;
 
@@ -200,6 +206,8 @@ pub fn catalog() -> impl Iterator<Item = &'static EffectSpec> {
         .chain(creative::EFFECTS.iter())
         .chain(texture::CUSTOM.iter())
         .chain(distort::EFFECTS.iter())
+        .chain(glitch::EFFECTS.iter())
+        .chain(light::EFFECTS.iter())
         .chain(noise::NOISE.iter())
         .chain(noise::SHARPEN.iter())
         .chain(texture::TEXTURE.iter())
@@ -220,6 +228,8 @@ pub fn groups() -> Vec<(&'static str, &'static [EffectSpec])> {
         ("menu.effects.creative", creative::EFFECTS),
         ("menu.effects.custom", texture::CUSTOM),
         ("menu.effects.distort", distort::EFFECTS),
+        ("menu.effects.glitch", glitch::EFFECTS),
+        ("menu.effects.light", light::EFFECTS),
         ("menu.effects.noise", noise::NOISE),
         ("menu.effects.sharpen", noise::SHARPEN),
         ("menu.effects.texture", texture::TEXTURE),
@@ -422,7 +432,12 @@ pub fn vector_base(
     // A blend's steps are drawn beside the picture, not in it.
     c.effects
         .retain(|e| !tracedraw_core::document::beside_picture(e));
-    c.transform = Affine::scale_non_uniform(sx, sy);
+    // Fountain fills lie on the page box, so they are turned and mirrored
+    // the way the picture will be turned back on the page, or a turned or
+    // mirrored object's gradient ran the wrong way in its picture (#3983).
+    let local = Affine::scale_non_uniform(sx, sy);
+    c.carry_fills(local * shape.transform.inverse(), Affine::IDENTITY);
+    c.transform = local;
     let b = c.bounds();
     if !(b.width().is_finite() && b.height().is_finite()) || b.width() <= 0.0 && b.height() <= 0.0 {
         return None;
@@ -453,6 +468,7 @@ pub fn vector_base(
                 zoom,
                 origin_x: 0.0,
                 origin_y: h as f64,
+                stretch_y: 1.0,
             },
             preview: None,
             wireframe: false,
@@ -1173,6 +1189,63 @@ mod tests {
         hidden.effects[0].visible = false;
         let (same, _) = render_stack(&hidden, true, None).expect("renders");
         assert_eq!(same, src);
+    }
+
+    /// A Gaussian blur on a vector object spreads past the object's box
+    /// on the page: a view of only the blurred rim shows it as the whole
+    /// page does (#4082: the picture was cut at the object's box, a hard
+    /// edge round the blur).
+    #[test]
+    fn a_blurred_vector_object_is_not_cut_at_its_box() {
+        use tracedraw_core::document::{Shape, ShapeKind};
+        use tracedraw_core::geometry::{Rect, Size};
+        let mut doc = tracedraw_core::Document::new("t", Size::new(100.0, 100.0));
+        let mut sq = Shape::new(
+            tracedraw_core::ShapeId(7),
+            ShapeKind::Rect {
+                rect: Rect::new(40.0, 40.0, 60.0, 60.0),
+                radius: 0.0,
+                corners: None,
+            },
+        );
+        sq.fill = tracedraw_core::Fill::Solid(tracedraw_core::Color::BLACK);
+        sq.stroke = None;
+        let mut blur = new_effect("gaussian_blur");
+        blur.params.insert("radius".into(), 40.0);
+        sq.raster_fx = vector_raster_fx(&sq, &[], vec![blur], true, 150.0);
+        let rect = sq.raster_fx.as_ref().expect("picture").rect;
+        assert!(rect.x1 > 62.0, "the picture grows past the object: {rect:?}");
+        let page = doc.pages[0].id;
+        let layer = doc.pages[0].layers[0].id;
+        doc.layer_mut(layer).unwrap().shapes.push(sq);
+        let zoom = 4.0;
+        let alpha_at = |x0: f64, w: u32, x: f64, y: f64| {
+            let pm = tracedraw_render::render_page(
+                &doc,
+                page,
+                &tracedraw_render::RenderOptions {
+                    width: w,
+                    height: 400,
+                    view: tracedraw_render::ViewTransform {
+                        zoom,
+                        origin_x: -x0 * zoom,
+                        origin_y: 400.0,
+                        stretch_y: 1.0,
+                    },
+                    preview: None,
+                    wireframe: false,
+                    ..tracedraw_render::RenderOptions::default()
+                },
+            )
+            .expect("renders");
+            let px = ((x - x0) * zoom) as u32;
+            let py = (400.0 - y * zoom) as u32;
+            pm.pixel(px, py).expect("inside").alpha()
+        };
+        let whole = alpha_at(0.0, 400, 63.5, 50.0);
+        assert!(whole > 0, "the blur reaches past the box");
+        let rim = alpha_at(63.0, 36, 63.5, 50.0);
+        assert_eq!(rim, whole, "a view of the rim alone shows it too");
     }
 
     #[test]

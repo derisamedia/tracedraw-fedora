@@ -25,6 +25,7 @@ pub mod catalog;
 pub mod hyphen;
 #[cfg(any(windows, all(test, not(target_arch = "wasm32"))))]
 mod installed;
+mod kashida;
 pub mod traits;
 pub mod type1;
 
@@ -94,6 +95,9 @@ pub fn install() {
     tracedraw_core::document::text_outline::set(|req| fonts().outline_cached(req).as_ref().clone());
     tracedraw_core::document::text_outline::set_bounds(|req| fonts().bounds_cached(req));
     tracedraw_core::document::text_outline::set_glyphs(|req| fonts().glyph_layout(req));
+    tracedraw_core::document::text_outline::set_glyph_indices(|req| {
+        fonts().resolve_glyph_indices(req)
+    });
     tracedraw_core::document::text_outline::set_lines(|req| {
         let layout = fonts().layout(req);
         // Lines past what fits the frame flow on (to a linked frame);
@@ -1216,6 +1220,9 @@ fn cp1252_remapped(face: &ttf_parser::Face, text: &str) -> Option<String> {
 /// such as ஷ there, #1937), and so does U+F020 to U+F0FF, where text
 /// from other programs keeps a symbol font's codes.
 pub(crate) fn face_glyph(face: &ttf_parser::Face, c: char) -> Option<ttf_parser::GlyphId> {
+    if !has_outlines(face) {
+        return None;
+    }
     let symbol = |c: char| {
         // The code typed, or the place the symbol map keeps it at, as
         // text from other programs holds it (U+F084 for 0x84).
@@ -1236,6 +1243,38 @@ pub(crate) fn face_glyph(face: &ttf_parser::Face, c: char) -> Option<ttf_parser:
         .or_else(|| cp1252_twin(c).and_then(|t| face.glyph_index(t)))
         .or_else(|| symbol(c))
         .or_else(|| cp1252_twin(c).and_then(symbol))
+        .filter(|g| !picture_only(face, *g))
+}
+
+/// The glyph is only a picture (a colour font's bitmap with an empty
+/// outline, as in sbix fonts that carry a glyf table of blanks).
+fn picture_only(face: &ttf_parser::Face, g: ttf_parser::GlyphId) -> bool {
+    struct Any(bool);
+    impl ttf_parser::OutlineBuilder for Any {
+        fn move_to(&mut self, _: f32, _: f32) {
+            self.0 = true;
+        }
+        fn line_to(&mut self, _: f32, _: f32) {}
+        fn quad_to(&mut self, _: f32, _: f32, _: f32, _: f32) {}
+        fn curve_to(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32) {}
+        fn close(&mut self) {}
+    }
+    let t = face.tables();
+    if t.cbdt.is_none() && t.sbix.is_none() {
+        return false;
+    }
+    let mut any = Any(false);
+    face.outline_glyph(g, &mut any);
+    !any.0 && face.glyph_raster_image(g, u16::MAX).is_some()
+}
+
+/// The face draws its letters as outlines. A colour font made only of
+/// pictures (Noto Color Emoji: CBDT, no glyf or CFF table) has none: text
+/// in it was drawn as nothing, on screen, in print and in PDF files, so
+/// its letters are taken from a font that draws them.
+pub(crate) fn has_outlines(face: &ttf_parser::Face) -> bool {
+    let t = face.tables();
+    t.glyf.is_some() || t.cff.is_some() || t.cff2.is_some()
 }
 
 /// A letter of a symbol-encoded family as the character it draws; others
@@ -1636,6 +1675,62 @@ fn script_fonts(c: char) -> &'static [&'static str] {
             "Lohit Devanagari",
         ],
         0x0980..=0x09FF => &["Noto Sans Bengali", "Nirmala UI", "Vrinda", "Lohit Bengali"],
+        0x0A00..=0x0D7F => &[
+            "Nirmala UI",
+            "Noto Sans Tamil",
+            "Noto Sans Telugu",
+            "Noto Sans Kannada",
+            "Noto Sans Malayalam",
+            "Noto Sans Gujarati",
+            "Noto Sans Gurmukhi",
+            "Latha",
+            "Gautami",
+            "Tunga",
+            "Kartika",
+            "Shruti",
+            "Raavi",
+        ],
+        // Cyrillic and Cyrillic Extended (Russian, Ukrainian, Belarusian,
+        // Serbian, Bulgarian, Kazakh, Kyrgyz, Mongolian).
+        0x0400..=0x052F | 0x2DE0..=0x2DFF | 0xA640..=0xA69F => &[
+            "Arial",
+            "Segoe UI",
+            "Calibri",
+            "Tahoma",
+            "Liberation Sans",
+            "DejaVu Sans",
+            "Noto Sans",
+            "FreeSans",
+        ],
+        // Greek and Greek Extended.
+        0x0370..=0x03FF | 0x1F00..=0x1FFF => &[
+            "Arial",
+            "Segoe UI",
+            "Calibri",
+            "Tahoma",
+            "Liberation Sans",
+            "DejaVu Sans",
+            "Noto Sans",
+        ],
+        // Armenian and Georgian.
+        0x0530..=0x058F | 0x10A0..=0x10FF | 0x1C90..=0x1CBF | 0x2D00..=0x2D2F => &[
+            "Sylfaen",
+            "Segoe UI",
+            "DejaVu Sans",
+            "Noto Sans Armenian",
+            "Noto Sans Georgian",
+            "Arial",
+        ],
+        // Latin Extended (Central European, Turkish, Vietnamese, Baltic).
+        0x0100..=0x024F | 0x1E00..=0x1EFF => &[
+            "Arial",
+            "Segoe UI",
+            "Calibri",
+            "Tahoma",
+            "Liberation Sans",
+            "DejaVu Sans",
+            "Noto Sans",
+        ],
         _ => &[
             "DejaVu Sans",
             "Noto Sans",
@@ -1680,6 +1775,10 @@ struct Glyph {
     advance: f64,
     x_offset: f64,
     y_offset: f64,
+    /// How far the character is moved sideways from its place (its
+    /// horizontal offset, mm), already in `path`: text fitted to a path
+    /// moves it along the path instead (#3252).
+    shift_x: f64,
     /// The character this glyph (cluster) starts; used for spaces and tabs.
     ch: char,
     /// Index of that character in the concatenated span text.
@@ -1707,6 +1806,10 @@ struct Glyph {
     /// puts before the next letter, left out at the end of a line when
     /// the line is centred or set right (#2586).
     spacing: f64,
+    /// On a cluster's first glyph, the rank of stretching the join after
+    /// the cluster with a kashida (1 the best place, see
+    /// [`kashida::rank`]); 0 when its letter does not join the next.
+    kashida: u8,
 }
 
 /// Where a shaped glyph's outline comes from.
@@ -1761,6 +1864,9 @@ struct Line {
     /// Where the paragraph's drop cap and bullet go, on its first line.
     cap_x: Option<f64>,
     bullet_x: Option<f64>,
+    /// The spaces that ended the line, left out of its width and its
+    /// alignment; the caret still steps over them (#4014).
+    trailing: Vec<Glyph>,
 }
 
 pub struct TextLayout {
@@ -1817,6 +1923,8 @@ pub struct PathPlacement {
     lift: f64,
     flip: bool,
     orientation: PathTextOrientation,
+    /// The middle of the path's box, which radial letters line up with.
+    centre: Point,
 }
 
 impl PathPlacement {
@@ -1825,7 +1933,11 @@ impl PathPlacement {
         let (at, dir) = self.baseline.at(self.start + p.x - self.line_x0)?;
         let flip = if self.flip { -1.0 } else { 1.0 };
         let local = Point::new(0.0, flip * (p.y - self.line_y + self.lift));
-        Some(Affine::translate(at.to_vec2()) * letter_frame(self.orientation, dir) * local)
+        Some(
+            Affine::translate(at.to_vec2())
+                * letter_frame(self.orientation, dir, at, self.centre)
+                * local,
+        )
     }
 
     /// The point of the straight layout placed nearest the point `p`
@@ -3368,6 +3480,82 @@ impl FontSystem {
         self.face_and_weight(family, bold, italic).map(|(id, _)| id)
     }
 
+    /// Resolve a metafile `ETO_GLYPH_INDEX` run against the installed face
+    /// of `req.family`: back to Unicode text when every glyph has a Unicode
+    /// `cmap` entry, else to exact vector outlines placed with
+    /// `req.advances_mm`.
+    pub fn resolve_glyph_indices(
+        &self,
+        req: &tracedraw_core::document::text_outline::GlyphRunRequest<'_>,
+    ) -> Option<tracedraw_core::document::text_outline::ResolvedGlyphRun> {
+        use tracedraw_core::document::text_outline::ResolvedGlyphRun;
+        if req.gids.is_empty() {
+            return None;
+        }
+        self.ask_for(req.family);
+        let db = self.db();
+        let (id, _) = self.own_face(&db, req.family, req.bold, req.italic)?;
+        db.with_face_data(id, |data, index| {
+            let face = ttf_parser::Face::parse(data, index).ok()?;
+            let mut chars: HashMap<u16, char> = HashMap::new();
+            if let Some(cmap) = face.tables().cmap {
+                for st in cmap.subtables {
+                    if !st.is_unicode() {
+                        continue;
+                    }
+                    st.codepoints(|cp| {
+                        if let (Some(c), Some(g)) = (
+                            char::from_u32(cp).filter(|c| !c.is_control()),
+                            st.glyph_index(cp).filter(|g| g.0 != 0),
+                        ) {
+                            chars.entry(g.0).or_insert(c);
+                        }
+                    });
+                }
+            }
+            if req.gids.iter().all(|g| chars.contains_key(g)) {
+                let s: String = req
+                    .gids
+                    .iter()
+                    .filter_map(|g| chars.get(g).copied())
+                    .collect();
+                if !s.is_empty() {
+                    return Some(ResolvedGlyphRun::Text(s));
+                }
+            }
+            let upm = f64::from(face.units_per_em().max(1));
+            let scale = req.em_mm / upm;
+            if !scale.is_finite() || scale <= 0.0 {
+                return None;
+            }
+            let mut sink = OutlineSink {
+                path: BezPath::new(),
+                scale,
+                x: 0.0,
+                y: 0.0,
+            };
+            let mut pen_x = 0.0;
+            for (i, &gid) in req.gids.iter().enumerate() {
+                sink.x = pen_x;
+                let _ = face.outline_glyph(ttf_parser::GlyphId(gid), &mut sink);
+                let adv = req
+                    .advances_mm
+                    .get(i)
+                    .copied()
+                    .filter(|v| v.is_finite())
+                    .unwrap_or_else(|| {
+                        f64::from(
+                            face.glyph_hor_advance(ttf_parser::GlyphId(gid))
+                                .unwrap_or(0),
+                        ) * scale
+                    });
+                pen_x += adv;
+            }
+            (!sink.path.elements().is_empty()).then_some(ResolvedGlyphRun::Path(sink.path))
+        })
+        .flatten()
+    }
+
     /// [`FontSystem::face_for`] with the weight the text is to be drawn
     /// at: 400 or 700 when a face lists `family` itself ("Archivo Black"
     /// is a regular face of its own family), else the weight the name ends
@@ -3623,8 +3811,13 @@ impl FontSystem {
         let p = Arc::new(self.layout(req).path);
         let b = (!p.elements().is_empty()).then(|| p.bounding_box());
         if let Ok(mut c) = self.cache.lock() {
-            if c.len() > 2000 {
-                c.clear();
+            // Evict down to the limit one entry at a time: clearing the
+            // whole cache made every text re-shape after any overflow,
+            // which on a drawing with many texts cost a full re-shape per
+            // keystroke.
+            while c.len() > 2000 {
+                let Some(k) = c.keys().next().cloned() else { break };
+                c.remove(&k);
             }
             c.insert(key, (p.clone(), b));
         }
@@ -3907,7 +4100,8 @@ impl FontSystem {
             db.with_face_data(id, |d, i| {
                 ttf_parser::Face::parse(d, i)
                     .ok()
-                    .and_then(|f| f.glyph_index(c))
+                    .filter(has_outlines)
+                    .and_then(|f| f.glyph_index(c).filter(|g| !picture_only(&f, *g)))
                     .is_some()
             })
             .unwrap_or(false)
@@ -3929,6 +4123,9 @@ impl FontSystem {
                     return Some(id);
                 }
             }
+        }
+        if !searched_in_every_face(c) {
+            return None;
         }
         let db = self.db();
         let mut any = None;
@@ -4152,7 +4349,9 @@ impl FontSystem {
         let mut starts: Vec<usize> = infos.iter().map(|i| i.cluster as usize).collect();
         starts.sort_unstable();
         starts.dedup();
-        let mut claimed: Vec<usize> = Vec::new();
+        // (Looked up by halves and in a set: a search from the start for
+        // each glyph made a long text take seconds to lay out.)
+        let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let size_mm = size_pt * PT_MM;
         let hyphen_glyph = {
             let gid = face.glyph_index('-');
@@ -4203,7 +4402,9 @@ impl FontSystem {
             if let Some(w) = widen {
                 gp = w * gp;
             }
-            let cluster = chars.iter().position(|(i, _)| *i == info.cluster as usize);
+            let cluster = chars
+                .binary_search_by_key(&(info.cluster as usize), |(i, _)| *i)
+                .ok();
             let ch = cluster
                 .and_then(|k| chars.get(k))
                 .map(|(_, c)| *c)
@@ -4235,9 +4436,8 @@ impl FontSystem {
             }
             let start = info.cluster as usize;
             let cluster_end = starts
-                .iter()
+                .get(starts.partition_point(|c| *c <= start))
                 .copied()
-                .find(|c| *c > start)
                 .unwrap_or(text.len());
             let further = claimed.contains(&start);
             let joins = further
@@ -4250,10 +4450,16 @@ impl FontSystem {
                                 .and_then(|t| t.chars().next())
                                 .is_some_and(|c| continues_syllable(p, c))
                         });
+            // The join after the cluster, on its first glyph (#3827).
+            let kashida = if further || !rtl {
+                0
+            } else {
+                kashida::rank_after_cluster(text, start, cluster_end).unwrap_or(0)
+            };
             let cluster_text = if further {
                 String::new()
             } else {
-                claimed.push(start);
+                claimed.insert(start);
                 text.get(start..cluster_end).unwrap_or("").to_string()
             };
             // As the outline above: slanted, widened, then moved into the
@@ -4279,7 +4485,7 @@ impl FontSystem {
             });
             // Character spacing goes between letters: a space takes the
             // word spacing alone, and the letter before it gives back its
-            // character spacing, as CorelDRAW lays text out (#2586).
+            // character spacing (#2586).
             let word_break = ch == ' ' || ch == '\u{3000}';
             let spacing = if word_break { 0.0 } else { char_spacing };
             if word_break && !rtl {
@@ -4293,6 +4499,7 @@ impl FontSystem {
                 advance: adv + tracking + spacing,
                 x_offset: pos.x_offset as f64 * scale * width,
                 y_offset: pos.y_offset as f64 * scale,
+                shift_x,
                 ch,
                 char_idx: char_base + cluster.unwrap_or(0),
                 char_end: char_base + chars.partition_point(|(i, _)| *i < cluster_end),
@@ -4303,6 +4510,7 @@ impl FontSystem {
                 hyphen_after: hyphen_glyph.clone(),
                 spacing,
                 src: Some(src),
+                kashida,
             });
         }
         // Right to left the glyphs come as they are seen: back to text
@@ -4346,6 +4554,17 @@ impl FontSystem {
     }
 
     fn layout_with(&self, req: &TextRequest, collect: bool, fitted_only: bool) -> TextLayout {
+        if req.para.type_block && req.frame.is_some() && req.on_path.is_none() {
+            if let Some((spans, para)) = self.type_block(req) {
+                let block = TextRequest {
+                    spans: &spans,
+                    para: &para,
+                    align: TextAlign::ForceJustify,
+                    ..*req
+                };
+                return self.layout_scaled(&block, 1.0, collect, fitted_only);
+            }
+        }
         if req.para.fit_to_frame && req.frame.is_some() {
             // Scale the font size so the text fills the frame height.
             let (mut lo, mut hi) = (0.1, 20.0);
@@ -4363,6 +4582,295 @@ impl FontSystem {
             return self.layout_scaled(req, best, collect, fitted_only);
         }
         self.layout_scaled(req, 1.0, collect, fitted_only)
+    }
+
+    /// A type block of `req` (see `ParagraphStyle::type_block`): its
+    /// spans with each line's sizes scaled to fill the frame's width and
+    /// the space before each line turned into a line break (one
+    /// character for another, so the characters keep their places), and
+    /// the paragraph settings that lay it out line by line. The breaks
+    /// come from a target width: each paragraph is broken into lines of
+    /// about that natural width, every line scaled to the frame's width,
+    /// and of the targets tried the one whose lines fill the frame's
+    /// height most nearly without passing it wins (the most nearly, if
+    /// every one passes it). `None` with no words.
+    fn type_block(&self, req: &TextRequest) -> Option<(Vec<TextSpan>, ParagraphStyle)> {
+        let frame = req.frame?;
+        let para = req.para;
+        let width = (frame.width - para.left_indent - para.right_indent).max(1.0);
+        // The characters with the span each comes from.
+        let chars: Vec<(char, usize)> = req
+            .spans
+            .iter()
+            .enumerate()
+            .flat_map(|(i, s)| s.text.chars().map(move |c| (c, i)))
+            .collect();
+        // Words: runs of characters between spaces and line breaks, by
+        // paragraph.
+        let mut paras: Vec<Vec<(usize, usize)>> = vec![Vec::new()];
+        let mut start = None;
+        for (k, (c, _)) in chars.iter().enumerate() {
+            let gap = c.is_whitespace();
+            if gap {
+                if let Some(s) = start.take() {
+                    if let Some(p) = paras.last_mut() {
+                        p.push((s, k));
+                    }
+                }
+                if *c == '\n' || *c == '\u{2029}' {
+                    paras.push(Vec::new());
+                }
+            } else if start.is_none() {
+                start = Some(k);
+            }
+        }
+        if let Some(s) = start {
+            if let Some(p) = paras.last_mut() {
+                p.push((s, chars.len()));
+            }
+        }
+        if paras.iter().all(|p| p.is_empty()) {
+            return None;
+        }
+        // The spans of characters `a..b`, sizes times `scale`.
+        let slice = |a: usize, b: usize, scale: f64| -> Vec<TextSpan> {
+            let mut out: Vec<TextSpan> = Vec::new();
+            for &(c, i) in &chars[a..b] {
+                match out.last_mut() {
+                    Some(last) if last_span_is(last, &req.spans[i], scale) => {
+                        last.text.push(c)
+                    }
+                    _ => {
+                        let mut s = req.spans[i].clone();
+                        s.size_pt *= scale;
+                        s.text = c.to_string();
+                        out.push(s);
+                    }
+                }
+            }
+            out
+        };
+        fn last_span_is(last: &TextSpan, src: &TextSpan, scale: f64) -> bool {
+            let mut a = src.clone();
+            a.size_pt *= scale;
+            a.text.clear();
+            let mut b = last.clone();
+            b.text.clear();
+            a == b
+        }
+        let plain = ParagraphStyle {
+            first_line_indent: 0.0,
+            left_indent: 0.0,
+            right_indent: 0.0,
+            space_before: 0.0,
+            space_after: 0.0,
+            space_before_pct: None,
+            space_after_pct: None,
+            bullets: false,
+            drop_cap_lines: 0,
+            columns: 1,
+            column_widths: Vec::new(),
+            column_gutters: Vec::new(),
+            fit_to_frame: false,
+            type_block: false,
+            hyphenate: false,
+            ..para.clone()
+        };
+        // Each word's natural width and the size of its letters (mm).
+        let measure = |a: usize, b: usize| -> f64 {
+            let spans = slice(a, b, 1.0);
+            let r = TextRequest {
+                spans: &spans,
+                frame: None,
+                align: TextAlign::Left,
+                para: &plain,
+                on_path: None,
+            };
+            self.layout_scaled(&r, 1.0, false, false).bounds.width().max(0.0)
+        };
+        let size_of = |a: usize, b: usize| -> f64 {
+            chars[a..b]
+                .iter()
+                .map(|(_, i)| req.spans[*i].size_pt * 25.4 / 72.0)
+                .fold(0.0, f64::max)
+        };
+        let words: Vec<Vec<(f64, f64)>> = paras
+            .iter()
+            .map(|p| p.iter().map(|&(a, b)| (measure(a, b), size_of(a, b))).collect())
+            .collect();
+        // Lines of about `target` natural width: (first word, last word)
+        // per paragraph.
+        let lines_for = |target: f64| -> Vec<Vec<(usize, usize)>> {
+            words
+                .iter()
+                .map(|ws| {
+                    let mut lines = Vec::new();
+                    let mut first = 0;
+                    let mut run = 0.0;
+                    for (k, (w, size)) in ws.iter().enumerate() {
+                        let space = if k > first { size * 0.25 } else { 0.0 };
+                        let with = run + space + w;
+                        // Break before this word when the line without it
+                        // is nearer the target than the line with it.
+                        if k > first && (with - target).abs() > (run - target).abs() {
+                            lines.push((first, k - 1));
+                            first = k;
+                            run = *w;
+                        } else {
+                            run = with;
+                        }
+                    }
+                    if !ws.is_empty() {
+                        lines.push((first, ws.len() - 1));
+                    }
+                    lines
+                })
+                .collect()
+        };
+        // Each line's natural width and letter size.
+        let line_of = |p: usize, (a, b): (usize, usize)| -> (f64, f64) {
+            let ws = &words[p][a..=b];
+            let w: f64 = ws.iter().map(|(w, _)| w).sum::<f64>()
+                + ws.iter().skip(1).map(|(_, s)| s * 0.25).sum::<f64>();
+            let size = ws.iter().map(|(_, s)| *s).fold(0.0, f64::max);
+            (w.max(1e-6), size.max(1e-6))
+        };
+        // How high the lines stand once each fills the width.
+        let lead = 1.3;
+        let height_of = |lines: &[Vec<(usize, usize)>]| -> f64 {
+            lines
+                .iter()
+                .enumerate()
+                .flat_map(|(p, ls)| ls.iter().map(move |l| (p, *l)))
+                .map(|(p, l)| {
+                    let (w, size) = line_of(p, l);
+                    size * lead * width / w
+                })
+                .sum()
+        };
+        let widest = words
+            .iter()
+            .flatten()
+            .map(|(w, _)| *w)
+            .fold(0.0, f64::max);
+        let longest = (0..words.len())
+            .map(|p| {
+                if words[p].is_empty() {
+                    0.0
+                } else {
+                    line_of(p, (0, words[p].len() - 1)).0
+                }
+            })
+            .fold(0.0, f64::max);
+        // The targets' line sets, best first: those whose lines fit the
+        // height before those that pass it, each the nearer the better.
+        // (fits, how far from the height, the lines)
+        type LineSet = (bool, f64, Vec<Vec<(usize, usize)>>);
+        let mut sets: Vec<LineSet> = Vec::new();
+        let tries = 48;
+        for t in 0..=tries {
+            let target = widest + (longest - widest).max(0.0) * t as f64 / tries as f64;
+            let lines = lines_for(target);
+            if sets.iter().any(|(_, _, l)| *l == lines) {
+                continue;
+            }
+            let h = height_of(&lines);
+            sets.push((h <= frame.height, (frame.height - h).abs(), lines));
+        }
+        sets.sort_by(|x, y| y.0.cmp(&x.0).then(x.1.total_cmp(&y.1)));
+        let block_para = ParagraphStyle {
+            left_indent: para.left_indent,
+            right_indent: para.right_indent,
+            ..plain.clone()
+        };
+        // A line's own width as laid out (its words and the spaces
+        // between them), characters `a..b`.
+        let line_width = |a: usize, b: usize| -> f64 {
+            let spans = slice(a, b, 1.0);
+            let r = TextRequest {
+                spans: &spans,
+                frame: None,
+                align: TextAlign::Left,
+                para: &plain,
+                on_path: None,
+            };
+            let l = self.layout_scaled(&r, 1.0, false, false);
+            l.lines
+                .first()
+                .and_then(|x| Some(x.ends.last()? - x.starts.first()?))
+                .filter(|w| *w > 1e-6)
+                .unwrap_or_else(|| l.bounds.width().max(1e-6))
+        };
+        // The spans of a line set, every line `fill` of the width: each
+        // line's characters scaled, a line break for the space before
+        // each line but a paragraph's first.
+        let build = |lines: &[Vec<(usize, usize)>], fill: f64| -> Vec<TextSpan> {
+            let mut scale_at = vec![1.0f64; chars.len()];
+            let mut breaks = Vec::new();
+            for (p, ls) in lines.iter().enumerate() {
+                for (n, &(a, b)) in ls.iter().enumerate() {
+                    let (from, to) = (paras[p][a].0, paras[p][b].1);
+                    let s = fill * width / line_width(from, to);
+                    for v in &mut scale_at[from..to] {
+                        *v = s;
+                    }
+                    if n > 0 {
+                        // The gap before the line's first word.
+                        let gap_start = paras[p][a - 1].1;
+                        for v in &mut scale_at[gap_start..from] {
+                            *v = s;
+                        }
+                        breaks.push(gap_start);
+                    }
+                }
+            }
+            let mut out: Vec<TextSpan> = Vec::new();
+            for (k, &(c, i)) in chars.iter().enumerate() {
+                let c = if breaks.binary_search(&k).is_ok() { '\n' } else { c };
+                let s = scale_at[k];
+                match out.last_mut() {
+                    Some(last) if last_span_is(last, &req.spans[i], s) => last.text.push(c),
+                    _ => {
+                        let mut span = req.spans[i].clone();
+                        span.size_pt *= s;
+                        span.text = c.to_string();
+                        out.push(span);
+                    }
+                }
+            }
+            out
+        };
+        // The first set whose block fits the frame, laid out for real (a
+        // hair under the width, so rounding never wraps a line; forced
+        // justification takes up the rest). None fits: the best set made
+        // smaller as a whole until it does.
+        let fits = |spans: &[TextSpan]| -> bool {
+            let r = TextRequest {
+                spans,
+                frame: req.frame,
+                align: TextAlign::ForceJustify,
+                para: &block_para,
+                on_path: None,
+            };
+            !self.layout_scaled(&r, 1.0, false, true).overflow
+        };
+        for (_, _, lines) in sets.iter().take(8) {
+            let spans = build(lines, 0.99);
+            if fits(&spans) {
+                return Some((spans, block_para));
+            }
+        }
+        let lines = &sets.first()?.2;
+        let mut fill = 0.99;
+        let mut spans = build(lines, fill);
+        for _ in 0..12 {
+            if fits(&spans) {
+                break;
+            }
+            fill *= 0.92;
+            spans = build(lines, fill);
+        }
+        Some((spans, block_para))
     }
 
     /// The key of a text's shaped glyphs: what [`FontSystem::cache_key`]
@@ -4400,9 +4908,16 @@ impl FontSystem {
         if glyphs <= SHAPED_GLYPHS {
             if let Ok(mut c) = self.shaped.lock() {
                 // Few: what is kept is for the texts being worked on now.
-                let kept: usize = c.values().map(|s| s.glyphs()).sum();
-                if c.len() >= SHAPED_KEPT || kept + glyphs > SHAPED_GLYPHS {
-                    c.clear();
+                // Evict one entry at a time until the new one fits, instead
+                // of clearing everything: a full clear made every text
+                // re-shape on the next frame, a full re-shape per keystroke
+                // on drawings with many texts.
+                let mut kept: usize = c.values().map(|s| s.glyphs()).sum();
+                while c.len() >= SHAPED_KEPT || kept + glyphs > SHAPED_GLYPHS {
+                    let Some(k) = c.keys().next().cloned() else { break };
+                    if let Some(old) = c.remove(&k) {
+                        kept = kept.saturating_sub(old.glyphs());
+                    }
                 }
                 c.insert(key, shaped.clone());
             }
@@ -4455,9 +4970,12 @@ impl FontSystem {
                 }
                 first = false;
                 // Tabs are kept as glyph-less markers so the line breaker can
-                // expand them to the next tab stop.
-                let mut parts = piece.split('\t').enumerate().peekable();
-                while let Some((ti, part)) = parts.next() {
+                // expand them to the next tab stop, and so is a line break
+                // inside the paragraph (Shift+Enter, U+2028), where the
+                // breaker ends the line; shaped, it drew the font's empty
+                // box (d#2238).
+                let mut parts = split_markers(piece).into_iter().enumerate().peekable();
+                while let Some((ti, (marker, part))) = parts.next() {
                     if ti > 0 {
                         if let Some(p) = paragraphs.last_mut() {
                             p.push(Glyph {
@@ -4465,7 +4983,8 @@ impl FontSystem {
                                 advance: 0.0,
                                 x_offset: 0.0,
                                 y_offset: 0.0,
-                                ch: '\t',
+                                shift_x: 0.0,
+                                ch: marker,
                                 char_idx,
                                 char_end: char_idx + 1,
                                 rtl: false,
@@ -4475,6 +4994,7 @@ impl FontSystem {
                                 hyphen_after: None,
                                 src: None,
                                 spacing: 0.0,
+                                kashida: 0,
                             })
                         }
                         char_idx += 1;
@@ -4495,7 +5015,10 @@ impl FontSystem {
                         for (sj, next) in spans.iter().enumerate().skip(si + 1) {
                             let mut n = 0;
                             if shapes_alike(span, next) {
-                                n = next.text.find(['\n', '\t']).unwrap_or(next.text.len());
+                                n = next
+                                    .text
+                                    .find(['\n', '\t', LINE_BREAK])
+                                    .unwrap_or(next.text.len());
                                 if let Some(c) =
                                     next.text.get(..n).and_then(|t| t.chars().next_back())
                                 {
@@ -4715,37 +5238,55 @@ impl FontSystem {
             // and its indent; the lines after the first hang there too,
             // or go back under the bullet (#1443).
             let bullet = if ps.bullets {
-                ps.bullet.offset.max(0.0) + ps.bullet_indent
+                ps.bullet.lead() + ps.bullet_indent
             } else {
                 0.0
             };
             let indent_first = ps.left_indent + ps.first_line_indent + bullet;
-            let indent_rest = ps.left_indent + if ps.bullet.no_hanging { 0.0 } else { bullet };
+            // Without hanging, the lines after the first go back under the
+            // bullet, set in by its list level (#3685).
+            let under = if ps.bullets {
+                ps.bullet.lead() - ps.bullet.offset.max(0.0)
+            } else {
+                0.0
+            };
+            let indent_rest = ps.left_indent + if ps.bullet.no_hanging { under } else { bullet };
             let para_start = para_starts.get(pi).copied().unwrap_or(0);
             if col_boxes.is_none() {
-                // Artistic text: one line a paragraph.
-                let m = line_metrics(glyphs, metrics, m_para);
-                let advance = if pi == 0 {
-                    0.0
-                } else {
-                    ps.line_step(m.line_height, m.size)
-                };
-                y -= advance;
+                // Artistic text: one line a paragraph, and one more for
+                // each line break inside it (Shift+Enter).
+                let pieces = split_at_line_breaks(glyphs);
+                let count = pieces.len();
+                for (k, piece) in pieces.into_iter().enumerate() {
+                    let m = line_metrics(&piece, metrics, m_para);
+                    let advance = if pi == 0 && k == 0 {
+                        0.0
+                    } else {
+                        ps.line_step(m.line_height, m.size)
+                    };
+                    y -= advance;
+                    let start_char = if k == 0 {
+                        para_start
+                    } else {
+                        piece.first().map_or(para_start, |g| g.char_idx)
+                    };
+                    lines.push(Line {
+                        glyphs: piece,
+                        hyphen: None,
+                        metrics: m,
+                        last_in_para: k + 1 == count,
+                        para: pi,
+                        start_char,
+                        y,
+                        x0: if k == 0 { indent_first } else { indent_rest },
+                        avail: f64::INFINITY,
+                        col_x: 0.0,
+                        cap_x: None,
+                        bullet_x: None,
+                        trailing: Vec::new(),
+                    });
+                }
                 prev_para = Some(pi);
-                lines.push(Line {
-                    glyphs: glyphs.clone(),
-                    hyphen: None,
-                    metrics: m,
-                    last_in_para: true,
-                    para: pi,
-                    start_char: para_start,
-                    y,
-                    x0: indent_first,
-                    avail: f64::INFINITY,
-                    col_x: 0.0,
-                    cap_x: None,
-                    bullet_x: None,
-                });
                 continue;
             };
             // A drop cap takes the first glyph out of the first line and
@@ -4754,10 +5295,14 @@ impl FontSystem {
                 let step = ps.line_step(m_para.line_height, m_para.size);
                 let n = ps.drop_cap_lines as f64;
                 let (outline, advance) = drop_cap_outline(glyphs);
-                let (scale, _) = drop_cap_placement(&outline, n, step, 0.0, m_para.ascent);
+                let below = drop_cap_room_below(step, m_para.ascent, m_para.descent);
+                let (scale, base) =
+                    drop_cap_placement(&outline, n, step, 0.0, m_para.ascent, below);
+                // Below the last line's baseline.
+                let last = -(n - 1.0) * step;
                 DropCap {
                     width: drop_cap_extent(&outline, advance).1 * scale + 1.0,
-                    depth: drop_cap_depth(&outline) * scale,
+                    depth: (drop_cap_depth(&outline) * scale - (base - last)).max(0.0),
                     lines: ps.drop_cap_lines as usize,
                     glyph_advance: advance,
                 }
@@ -4970,11 +5515,8 @@ impl FontSystem {
                             line.cap_x = Some(line.x0 - cap_w);
                         }
                         if ps.bullets {
-                            line.bullet_x = Some(
-                                line.x0 - cap_w - indent
-                                    + ps.left_indent
-                                    + ps.bullet.offset.max(0.0),
-                            );
+                            line.bullet_x =
+                                Some(line.x0 - cap_w - indent + ps.left_indent + ps.bullet.lead());
                         }
                     }
                     lines.push(line);
@@ -5062,6 +5604,9 @@ impl FontSystem {
                 p
             }
         };
+        // The kashida of each span's face (#3827), shaped when a line
+        // first stretches a join in it; `None` when the face has none.
+        let mut tatweels: HashMap<usize, Option<Glyph>> = HashMap::new();
         for (li, line) in lines.iter().enumerate() {
             let m = line.metrics;
             let (align, ps) = style_of(line.para);
@@ -5098,8 +5643,9 @@ impl FontSystem {
                 // letter wider than its room (#2575).
                 let mp = metrics.get(g.span).copied().unwrap_or(m);
                 let cap_step = ps.line_step(mp.line_height, mp.size);
+                let below = drop_cap_room_below(cap_step, mp.ascent, mp.descent);
                 let (scale, baseline) =
-                    drop_cap_placement(&outline, n, cap_step, line.y, mp.ascent);
+                    drop_cap_placement(&outline, n, cap_step, line.y, mp.ascent, below);
                 let (lead, extent) = drop_cap_extent(&outline, advance);
                 // Mirrored: the cap's band runs from the first line's top
                 // to its own descent, its baseline on the band's left.
@@ -5142,7 +5688,14 @@ impl FontSystem {
             // Bullet.
             if let (Some(bx), false) = (line.bullet_x, artistic) {
                 let first_span = glyphs.first().map(|g| g.span).unwrap_or(0);
-                if let Some(span) = spans.get(first_span).filter(|_| span_drawn(first_span)) {
+                // In a text drawn in parts, a bullet of its own colour is
+                // drawn in that colour's part (#3682).
+                let drawn = tracedraw_core::BulletPart::draws(
+                    ps.bullet_part,
+                    ps.bullet.color,
+                    span_drawn(first_span),
+                );
+                if let Some(span) = spans.get(first_span).filter(|_| drawn) {
                     // The symbol or the paragraph's number, in the
                     // bullet's own font, size and shift (#1443).
                     let label = ps.bullet.label(
@@ -5159,12 +5712,25 @@ impl FontSystem {
                     if ps.bullet.baseline_shift.is_finite() {
                         bspan.baseline_shift_pt += ps.bullet.baseline_shift / PT_MM;
                     }
+                    // Its own bold and italic (#3682).
+                    if let Some(b) = ps.bullet.bold {
+                        bspan.bold = b;
+                    }
+                    if let Some(i) = ps.bullet.italic {
+                        bspan.italic = i;
+                    }
                     let b = self.shape_run(&bspan, 0, &label, size_scale, 0, ps, &[]);
+                    let mut bpen = bx;
                     for g in &b {
-                        let a = orient(Affine::translate((bx, y)), g, m.ascent);
+                        let a = orient(
+                            Affine::translate((bpen + g.x_offset, y + g.y_offset)),
+                            g,
+                            m.ascent,
+                        );
                         place_glyph(collect, a, g, &mut line_glyphs);
                         let gp = a * g.path.as_ref().clone();
                         line_path.extend(gp.elements().iter().copied());
+                        bpen += g.advance;
                     }
                 }
             }
@@ -5176,12 +5742,12 @@ impl FontSystem {
             let total_w = content_w + hyphen_w;
             // A centred or right-set line is placed by its letters: the
             // spaces it ends with and the character spacing after its last
-            // letter take no room, as in CorelDRAW (#2586).
+            // letter take no room (#2586).
             let total_w = match align {
                 TextAlign::Center | TextAlign::Right if line.hyphen.is_none() => {
                     let kept = glyphs
                         .iter()
-                        .rposition(|g| !matches!(g.ch, ' ' | '\u{3000}' | '\n' | '\r'))
+                        .rposition(|g| !matches!(g.ch, ' ' | '\u{3000}' | '\n' | '\r' | LINE_BREAK))
                         .map_or(0, |i| i + 1);
                     let trimmed = &glyphs[..kept];
                     let w = line_width(trimmed, ps, x0 - col_start, tab_step);
@@ -5189,17 +5755,59 @@ impl FontSystem {
                 }
                 _ => total_w,
             };
+            // The joins stretched on this line: (the character of the
+            // cluster before the join, width), see [`kashida_widths`].
+            let mut kash: Vec<(usize, f64)> = Vec::new();
             let (dx, extras) = match align {
                 TextAlign::Left | TextAlign::None => (0.0, Vec::new()),
                 TextAlign::Center => (((avail.min(1e9)) - total_w).max(0.0) / 2.0, Vec::new()),
                 TextAlign::Right => ((avail.min(1e9) - total_w).max(0.0), Vec::new()),
                 TextAlign::Justify | TextAlign::ForceJustify => {
                     // Forced justification spreads the last line too.
-                    let last = line.last_in_para && align == TextAlign::Justify;
-                    if last || !avail.is_finite() {
+                    // So is a line ended by a line break (Shift+Enter).
+                    let last = (line.last_in_para || glyphs.iter().any(|g| g.ch == LINE_BREAK))
+                        && align == TextAlign::Justify;
+                    // A paragraph running right to left (set so, or by
+                    // its first strong letter) ends at the right: its
+                    // last line is set from the right edge (#3216).
+                    let rtl = ps.direction.is_right_to_left()
+                        || glyphs
+                            .iter()
+                            .filter(|g| !g.ch.is_whitespace())
+                            .map(|g| g.level)
+                            .min()
+                            .is_some_and(|l| l % 2 == 1);
+                    if last && rtl && avail.is_finite() {
+                        ((avail - total_w).max(0.0), Vec::new())
+                    } else if last || !avail.is_finite() {
                         (0.0, Vec::new())
-                    } else {
+                    } else if ps.kashida.is_off() {
                         (0.0, justify_extras(glyphs, avail - total_w))
+                    } else {
+                        // Arabic-script words take their share by
+                        // stretching a join; the spaces take the rest.
+                        for g in glyphs.iter().filter(|g| g.kashida > 0) {
+                            tatweels.entry(g.span).or_insert_with(|| {
+                                spans.get(g.span).and_then(|span| {
+                                    self.shape_run(span, g.span, "\u{0640}", size_scale, 0, ps, &[])
+                                        .into_iter()
+                                        .next()
+                                        .filter(|t| {
+                                            t.advance > 1e-6
+                                                && t.src.as_ref().is_some_and(|s| s.gid != 0)
+                                        })
+                                })
+                            });
+                        }
+                        kash = kashida_widths(
+                            glyphs,
+                            avail - total_w,
+                            ps.kashida,
+                            |si| metrics.get(si).map_or(0.0, |m| m.size),
+                            |si| tatweels.get(&si).is_some_and(Option::is_some),
+                        );
+                        let used: f64 = kash.iter().map(|k| k.1).sum();
+                        (0.0, justify_extras(glyphs, avail - total_w - used))
                     }
                 }
             };
@@ -5288,7 +5896,11 @@ impl FontSystem {
                 let next_idx = match glyphs.get(gi + 1) {
                     Some(n) if n.char_idx > g.char_idx => n.char_idx,
                     Some(_) => g.char_end,
-                    None => end_char,
+                    // The spaces ending the line follow it (#4014).
+                    None => match line.trailing.first() {
+                        Some(t) if !g.rtl && t.char_idx > g.char_idx => t.char_idx,
+                        _ => end_char,
+                    },
                 }
                 .max(g.char_idx + 1);
                 if g.ch == '\t' {
@@ -5335,6 +5947,43 @@ impl FontSystem {
                     record(g.char_idx, next_idx, before, pen, false);
                     continue;
                 }
+                // A stretched join: the kashida drawn, widened, on the
+                // left of the cluster before it (that cluster's first
+                // glyph seen), where its next letter ends (#3827).
+                let lead = match kash.iter().position(|(c, _)| *c == g.char_idx) {
+                    Some(p) => {
+                        let (_, w) = kash.swap_remove(p);
+                        if let Some(Some(t)) = tatweels.get(&g.span).filter(|_| span_drawn(g.span))
+                        {
+                            let stretched = Glyph {
+                                char_idx: g.char_idx,
+                                char_end: g.char_idx,
+                                span: g.span,
+                                src: t.src.as_ref().map(|s| {
+                                    Arc::new(GlyphSource {
+                                        font: s.font.clone(),
+                                        gid: s.gid,
+                                        local: s.local,
+                                        text: String::new(),
+                                        exact: s.exact,
+                                    })
+                                }),
+                                ..t.clone()
+                            };
+                            let a = orient(
+                                Affine::translate((pen, y + t.y_offset)),
+                                &stretched,
+                                metrics[g.span].ascent,
+                            ) * Affine::scale_non_uniform(w / t.advance, 1.0);
+                            place_glyph(collect, a, &stretched, &mut line_glyphs);
+                            let gp = a * t.path.as_ref().clone();
+                            line_path.extend(gp.elements().iter().copied());
+                        }
+                        pen += w;
+                        w
+                    }
+                    None => 0.0,
+                };
                 if span_drawn(g.span) {
                     let a = Affine::translate((pen + g.x_offset, y + g.y_offset));
                     let a = orient(a, g, metrics[g.span].ascent);
@@ -5351,11 +6000,13 @@ impl FontSystem {
                         if !style.is_on() || (space && style.word_only()) {
                             return;
                         }
+                        // From before the kashida, which the line runs under too.
+                        let from = pen - lead;
                         match runs.last_mut() {
-                            Some((s, _, end)) if *s == g.span && (*end - pen).abs() < 1e-6 => {
+                            Some((s, _, end)) if *s == g.span && (*end - from).abs() < 1e-6 => {
                                 *end = pen + adv
                             }
-                            _ => runs.push((g.span, pen, pen + adv)),
+                            _ => runs.push((g.span, from, pen + adv)),
                         }
                     };
                     extend(&mut underline_runs, span.underline);
@@ -5374,6 +6025,25 @@ impl FontSystem {
                 }
                 pen += adv;
                 glyph_count += 1;
+            }
+            // The spaces that ended the line: no room in it. At the end
+            // of a paragraph, where the text is being typed, the caret
+            // after each stands a space further on, so a space typed
+            // there moves the caret at once; it stayed put until the next
+            // letter came (#4014). Where a line wraps, they stay at its
+            // end, the line's width as before.
+            if glyphs.last().is_none_or(|g| !g.rtl) {
+                let mut x = pen;
+                for (k, t) in line.trailing.iter().enumerate() {
+                    let next = line
+                        .trailing
+                        .get(k + 1)
+                        .map_or(end_char, |n| n.char_idx)
+                        .max(t.char_idx + 1);
+                    let adv = if line.last_in_para { t.advance } else { 0.0 };
+                    record(t.char_idx, next, x, x + adv, false);
+                    x += adv;
+                }
             }
             let starts: Vec<f64> = starts
                 .iter()
@@ -5587,6 +6257,17 @@ pub fn upright(ch: char) -> bool {
     )
 }
 
+/// Whether a character missing from its own face is looked for in every
+/// font of the system. Not a private-use character (U+E000 to U+F8FF and
+/// the two supplementary private planes): each font puts its own pictures
+/// there, so another font's glyph is never the one meant, and the search
+/// read every font once per such character. A drawing in an old symbol
+/// font that is not installed, whose letters sit in that range, took
+/// minutes to open on a system with thousands of fonts (#3371).
+fn searched_in_every_face(c: char) -> bool {
+    !matches!(c as u32, 0xE000..=0xF8FF | 0xF0000..=0x10FFFF)
+}
+
 /// The tallest metrics among a line's glyphs; `fallback` for a line with
 /// none (a larger first span elsewhere in the paragraph, such as a big
 /// first letter, does not open up the other lines).
@@ -5609,13 +6290,17 @@ fn line_metrics(glyphs: &[Glyph], metrics: &[Metrics], fallback: Metrics) -> Met
 /// whose first line has its baseline at `baseline` (y up): the letter sits
 /// on the last line's baseline and its top meets the top of the first
 /// line's letters (the glyph's own height there, or 70 % of `ascent` for
-/// a glyph without outline).
+/// a glyph without outline). A letter whose ink hangs below its baseline
+/// (g, y, j, p) is made smaller so that ink ends within `below` under the
+/// last baseline, the room the last line's own descenders take: scaled
+/// to its top alone, a g hung into the line after the set count (#2979).
 fn drop_cap_placement(
     glyph: &BezPath,
     lines: f64,
     step: f64,
     baseline: f64,
     ascent: f64,
+    below: f64,
 ) -> (f64, f64) {
     let top = glyph.bounding_box().y1;
     let letter = if top.is_finite() && top > 1e-6 {
@@ -5630,7 +6315,24 @@ fn drop_cap_placement(
     } else {
         lines
     };
-    (scale.max(1.0), last)
+    let scale = scale.max(1.0);
+    let depth = drop_cap_depth(glyph);
+    let below = below.max(0.0);
+    if depth * scale > below + 1e-9 {
+        // From the first line's top down to `below` under the last
+        // baseline, the ink's top and bottom.
+        let fit = (height + below) / (letter + depth);
+        if fit < scale {
+            return (fit, baseline + letter - letter * fit);
+        }
+    }
+    (scale, last)
+}
+
+/// The room under a drop cap's last baseline its ink may take: the
+/// line's descent, short of the next line's letters.
+fn drop_cap_room_below(step: f64, ascent: f64, descent: f64) -> f64 {
+    descent.min(step - ascent - 0.01).max(0.0)
 }
 
 /// How many glyphs at the start of `glyphs` a drop cap takes: the first
@@ -5705,6 +6407,76 @@ fn tabbed_width(glyphs: &[Glyph], tabs: &[TabStop], step: f64, start: f64) -> f6
         }
     }
     x - start
+}
+
+/// The joins a justified line stretches with a kashida (#3827), as (the
+/// character that starts the cluster before the join, width), and so
+/// the share of `room` they take; the line's spaces take the rest.
+///
+/// Each word of connected Arabic-script letters stretches one join: the
+/// best-ranked one (see [`kashida::rank`]), the last of equal ones. The
+/// joins share the part of `room` that `setting` gives them equally,
+/// none by more than its most (in ems of the letters' size), the rest
+/// going back to the spaces; a line without spaces gives the joins all
+/// of it. `size` is a span's font size (mm), and `has_kashida` whether
+/// its face has a kashida to draw.
+fn kashida_widths(
+    glyphs: &[Glyph],
+    room: f64,
+    setting: tracedraw_core::document::Kashida,
+    size: impl Fn(usize) -> f64,
+    has_kashida: impl Fn(usize) -> bool,
+) -> Vec<(usize, f64)> {
+    let (share, cap_em) = setting.share_and_cap();
+    if room <= 1e-9 || !room.is_finite() || share <= 0.0 {
+        return Vec::new();
+    }
+    let last = glyphs
+        .iter()
+        .rposition(|g| !g.ch.is_whitespace())
+        .unwrap_or(0);
+    let spaces = glyphs[..last]
+        .iter()
+        .any(|g| g.ch == ' ' || g.ch == '\u{3000}');
+    // The best join of each word: (rank, cluster character, span).
+    let mut chosen: Vec<(u8, usize, usize)> = Vec::new();
+    let mut best: Option<(u8, usize, usize)> = None;
+    for (i, g) in glyphs.iter().enumerate().take(last + 1) {
+        if g.ch.is_whitespace() || !g.rtl {
+            chosen.extend(best.take());
+            continue;
+        }
+        if g.kashida == 0 || !has_kashida(g.span) {
+            continue;
+        }
+        // The next cluster must follow on this line, joined to this one.
+        let next = glyphs[i + 1..].iter().find(|n| n.char_idx != g.char_idx);
+        if !next.is_some_and(|n| {
+            n.rtl && n.char_idx == g.char_end && n.char_idx <= glyphs[last].char_idx
+        }) {
+            continue;
+        }
+        if best.is_none_or(|(r, _, _)| g.kashida <= r) {
+            best = Some((g.kashida, g.char_idx, g.span));
+        }
+    }
+    chosen.extend(best);
+    if chosen.is_empty() {
+        return Vec::new();
+    }
+    let (share, capped) = if spaces { (share, true) } else { (1.0, false) };
+    let each = room * share / chosen.len() as f64;
+    chosen
+        .into_iter()
+        .map(|(_, c, si)| {
+            let w = if capped {
+                each.min(cap_em * size(si))
+            } else {
+                each
+            };
+            (c, w)
+        })
+        .collect()
 }
 
 /// The width added after each glyph of a justified line (indexed like
@@ -5912,6 +6684,41 @@ fn cjk_break(a: char, b: char) -> bool {
     (cjk_char(a) || cjk_char(b)) && !no_line_start(b) && !no_line_end(a)
 }
 
+/// The line break inside a paragraph (Shift+Enter): U+2028 LINE SEPARATOR.
+const LINE_BREAK: char = '\u{2028}';
+
+/// `piece` cut at its tabs and line breaks: each part with the marker
+/// that comes before it (the first part's is unused).
+fn split_markers(piece: &str) -> Vec<(char, &str)> {
+    let mut out = Vec::new();
+    let mut marker = '\t';
+    let mut from = 0;
+    for (i, c) in piece.char_indices() {
+        if c == '\t' || c == LINE_BREAK {
+            out.push((marker, &piece[from..i]));
+            marker = c;
+            from = i + c.len_utf8();
+        }
+    }
+    out.push((marker, &piece[from..]));
+    out
+}
+
+/// A paragraph's glyphs cut into lines after each line break (the break
+/// stays at the end of its line); one line when there is none.
+fn split_at_line_breaks(glyphs: &[Glyph]) -> Vec<Vec<Glyph>> {
+    let mut out = vec![Vec::new()];
+    for g in glyphs {
+        if let Some(l) = out.last_mut() {
+            l.push(g.clone());
+        }
+        if g.ch == LINE_BREAK {
+            out.push(Vec::new());
+        }
+    }
+    out
+}
+
 /// Greedy line breaking at spaces, with optional hyphenation and a
 /// fallback to breaking inside words that do not fit alone, one line at a
 /// time for the room each line has.
@@ -5923,8 +6730,11 @@ struct Breaker<'a> {
     tail: Option<Vec<Glyph>>,
     /// The next line is the paragraph's first.
     first: bool,
-    /// An empty paragraph still owes its one empty line.
+    /// An empty paragraph still owes its one empty line, as does a line
+    /// break at the end of a paragraph.
     empty_pending: bool,
+    /// Where that empty line after a line break starts, in characters.
+    after_break: Option<usize>,
     hyphenate: bool,
     /// The paragraph's tab stops (a line's width depends on them) and
     /// the default spacing past them.
@@ -5948,7 +6758,7 @@ impl<'a> Breaker<'a> {
         let mut words: Vec<Vec<Glyph>> = Vec::new();
         let mut cur: Vec<Glyph> = Vec::new();
         for (k, g) in glyphs.iter().enumerate() {
-            let is_sep = g.ch == ' ' || g.ch == '\t';
+            let is_sep = g.ch == ' ' || g.ch == '\t' || g.ch == LINE_BREAK;
             cur.push(g.clone());
             // Text without spaces (Chinese, Japanese) breaks between its
             // characters, where the line-start and line-end rules allow.
@@ -5964,6 +6774,7 @@ impl<'a> Breaker<'a> {
         }
         Breaker {
             empty_pending: words.is_empty(),
+            after_break: None,
             words,
             i: 0,
             tail: None,
@@ -5974,6 +6785,15 @@ impl<'a> Breaker<'a> {
             metrics,
             pi,
             para_start,
+        }
+    }
+
+    /// After the line break ending `line`: the paragraph's last word
+    /// leaves one empty line to come.
+    fn break_after(&mut self, line: &[Glyph]) {
+        if self.i >= self.words.len() {
+            self.empty_pending = true;
+            self.after_break = line.last().map(|g| g.char_idx + 1);
         }
     }
 
@@ -5994,11 +6814,14 @@ impl<'a> Breaker<'a> {
         let start_char = glyphs
             .first()
             .map(|g| g.char_idx)
+            .or(self.after_break)
             .unwrap_or(self.para_start);
         // Trailing spaces do not count toward alignment: strip them.
+        let mut trailing = Vec::new();
         while glyphs.last().map(|g| g.ch == ' ').unwrap_or(false) {
-            glyphs.pop();
+            trailing.extend(glyphs.pop());
         }
+        trailing.reverse();
         let fallback = self.metrics.first().copied().unwrap_or_default();
         Line {
             metrics: line_metrics(&glyphs, self.metrics, fallback),
@@ -6013,6 +6836,7 @@ impl<'a> Breaker<'a> {
             col_x: 0.0,
             cap_x: None,
             bullet_x: None,
+            trailing,
         }
     }
 
@@ -6044,10 +6868,17 @@ impl<'a> Breaker<'a> {
                     None => break,
                 },
             };
+            let forced = word.last().is_some_and(|g| g.ch == LINE_BREAK);
             if trimmed(&[line.as_slice(), word.as_slice()].concat()) <= avail {
                 line.extend(word);
                 self.tail = None;
                 self.i += 1;
+                if forced {
+                    // A line break inside the paragraph ends the line; one
+                    // at its end still leaves the empty line after it.
+                    self.break_after(&line);
+                    break;
+                }
                 continue;
             }
             // Try hyphenating the word.
@@ -6095,6 +6926,9 @@ impl<'a> Breaker<'a> {
                 line.extend(word);
                 self.tail = None;
                 self.i += 1;
+                if forced {
+                    self.break_after(&line);
+                }
             }
             break;
         }
@@ -6157,22 +6991,25 @@ fn place_on_path(
     } else {
         Affine::IDENTITY
     };
+    let centre = tp.path.bounding_box().center();
     let mut pen = start;
     let order = display_order(&line.glyphs);
     for k in 0..line.glyphs.len() {
         let Some(g) = line.glyphs.get(order.as_ref().map_or(k, |o| o[k])) else {
             continue;
         };
-        let mid = pen + g.advance / 2.0;
+        // A character moved sideways goes that far along the path, turned
+        // as the path is there (#3252).
+        let mid = pen + g.advance / 2.0 + g.shift_x;
         pen += g.advance;
         let Some((p, dir)) = baseline.at(mid) else {
             continue;
         };
-        let along = letter_frame(tp.orientation, dir);
+        let along = letter_frame(tp.orientation, dir, p, centre);
         let place = Affine::translate(p.to_vec2())
             * along
             * flip
-            * Affine::translate((-g.advance / 2.0 + g.x_offset, g.y_offset + lift));
+            * Affine::translate((-g.advance / 2.0 + g.x_offset - g.shift_x, g.y_offset + lift));
         if spans.get(g.span).is_some_and(|s| s.layout_only) {
             continue;
         }
@@ -6189,6 +7026,7 @@ fn place_on_path(
         lift,
         flip: tp.flipped(),
         orientation: tp.orientation,
+        centre,
     };
     (out, Some(placement))
 }
@@ -6207,6 +7045,7 @@ fn place_glyph(collect: bool, a: Affine, g: &Glyph, out: &mut GlyphLayout) {
             transform: a * src.local,
             text: src.text.clone(),
             span: g.span,
+            char_idx: g.char_idx,
             path,
             exact: src.exact,
         }),
@@ -6214,9 +7053,15 @@ fn place_glyph(collect: bool, a: Affine, g: &Glyph, out: &mut GlyphLayout) {
     }
 }
 
-/// How a letter centred at a point of the path with unit direction `dir`
-/// is turned or sheared there (before the letter's own flip).
-fn letter_frame(o: PathTextOrientation, dir: tracedraw_core::geometry::Vec2) -> Affine {
+/// How a letter centred at the point `at` of the path with unit direction
+/// `dir` is turned or sheared there (before the letter's own flip);
+/// `centre` is the middle of the path's box, for radial letters.
+fn letter_frame(
+    o: PathTextOrientation,
+    dir: tracedraw_core::geometry::Vec2,
+    at: Point,
+    centre: Point,
+) -> Affine {
     // The direction's horizontal part, kept away from zero so a nearly
     // vertical stretch of path does not shear a letter to a line.
     let cx = if dir.x.abs() < 0.2 {
@@ -6231,6 +7076,18 @@ fn letter_frame(o: PathTextOrientation, dir: tracedraw_core::geometry::Vec2) -> 
         PathTextOrientation::VerticalSkew => Affine::new([1.0, dir.y / cx, 0.0, 1.0, 0.0, 0.0]),
         // x stays horizontal, y leans along the path's normal.
         PathTextOrientation::HorizontalSkew => Affine::new([1.0, 0.0, -dir.y / cx, 1.0, 0.0, 0.0]),
+        // The letter's upright lies on the line through the centre, its
+        // top on the side of the path the letters stand on (its left); at
+        // the centre itself, turned with the path.
+        PathTextOrientation::Radial => {
+            let out = at - centre;
+            if out.hypot() < 1e-9 {
+                return Affine::rotate(dir.y.atan2(dir.x));
+            }
+            let left = tracedraw_core::geometry::Vec2::new(-dir.y, dir.x);
+            let up = if out.dot(left) < 0.0 { -out } else { out };
+            Affine::rotate(up.y.atan2(up.x) - std::f64::consts::FRAC_PI_2)
+        }
     }
 }
 
@@ -6368,6 +7225,18 @@ fn decoration_rects(
 mod tests {
     use super::*;
 
+    /// #3371: a private-use character missing from its face is not looked
+    /// for in every installed font; other characters still are.
+    #[test]
+    fn private_use_characters_are_not_searched_in_every_font() {
+        for c in ['\u{E000}', '\u{F041}', '\u{F8FF}', '\u{F0000}', '\u{10FFFD}'] {
+            assert!(!searched_in_every_face(c), "{c:?}");
+        }
+        for c in ['a', '\u{0915}', '\u{D7FF}', '\u{F900}', '\u{1F600}'] {
+            assert!(searched_in_every_face(c), "{c:?}");
+        }
+    }
+
     /// d#2122: a Hebrew file name of two words reads right to left, the
     /// second word left of the first, with Latin and digits kept left to
     /// right inside it; a name without right-to-left letters is left alone.
@@ -6441,6 +7310,7 @@ mod tests {
                 advance: 1.0,
                 x_offset: 0.0,
                 y_offset: 0.0,
+                shift_x: 0.0,
                 ch,
                 char_idx: i,
                 char_end: i + 1,
@@ -6451,6 +7321,7 @@ mod tests {
                 hyphen_after: None,
                 src: None,
                 spacing: 0.0,
+                kashida: 0,
             })
             .collect();
         let metrics = [Metrics::default()];
@@ -6636,6 +7507,54 @@ mod tests {
         assert_eq!(line.ends[..], line.edges[1..]);
     }
 
+    /// #3216: a justified paragraph running right to left sets its last
+    /// line from the right edge, as a left-to-right one sets it from the
+    /// left; set so, or by its Hebrew letters.
+    #[test]
+    fn a_justified_right_to_left_paragraph_ends_at_the_right() {
+        if !has_fonts() {
+            return;
+        }
+        use tracedraw_core::TextDirection;
+        let width = 40.0;
+        let lay = |text: &str, para: &ParagraphStyle| {
+            fonts().layout(&TextRequest {
+                spans: &[span(text)],
+                frame: Some(Size::new(width, 100.0)),
+                align: TextAlign::Justify,
+                para,
+                on_path: None,
+            })
+        };
+        let words = "ab cd ef gh ij kl mn op qr st uv wx yz ab cd";
+        let ltr = ParagraphStyle::default();
+        let rtl = ParagraphStyle {
+            direction: TextDirection::RightToLeft,
+            ..ParagraphStyle::default()
+        };
+        let span_of = |l: &LineBox| {
+            let lo = l.edges.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = l.edges.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            (lo, hi)
+        };
+        let l = lay(words, &ltr);
+        if l.glyphs == 0 || l.lines.len() < 2 {
+            return;
+        }
+        let (lo, hi) = span_of(l.lines.last().unwrap());
+        assert!(lo.abs() < 1e-6 && hi < width - 1.0, "{lo} {hi}");
+        let r = lay(words, &rtl);
+        let (lo, hi) = span_of(r.lines.last().unwrap());
+        assert!((hi - width).abs() < 1e-3 && lo > 1.0, "{lo} {hi}");
+        // Hebrew letters make the paragraph right to left by themselves.
+        let hebrew = "\u{5D0}\u{5D1} \u{5D2}\u{5D3} ".repeat(8);
+        let h = lay(&hebrew, &ltr);
+        if h.lines.len() > 1 {
+            let (lo, hi) = span_of(h.lines.last().unwrap());
+            assert!((hi - width).abs() < 1e-3 && lo > 1.0, "{lo} {hi}");
+        }
+    }
+
     /// A paragraph set to run right to left (#2670): Latin letters keep
     /// their order, the full stop goes to the left end, a right-to-left
     /// word after them to their left, and the indents change
@@ -6699,6 +7618,61 @@ mod tests {
         let a = lay(ar, &ltr);
         let b = lay(ar, &rtl);
         assert_eq!(a.lines[0].starts, b.lines[0].starts);
+    }
+
+    /// Shift+Enter puts a line break (U+2028) in the paragraph: the line
+    /// ends there and the next one starts under it, with no first-line
+    /// indent and no space before, and nothing is drawn for the break
+    /// itself (it showed as an empty box, d#2238).
+    #[test]
+    fn a_line_break_inside_a_paragraph_starts_a_new_line() {
+        if !has_fonts() {
+            return;
+        }
+        let para = ParagraphStyle {
+            first_line_indent: 5.0,
+            space_before: 4.0,
+            ..ParagraphStyle::default()
+        };
+        let lay = |text: &str, frame: Option<Size>| {
+            fonts().layout(&TextRequest {
+                spans: &[span(text)],
+                frame,
+                align: TextAlign::Left,
+                para: &para,
+                on_path: None,
+            })
+        };
+        let frame = Some(Size::new(100.0, 50.0));
+        let one = lay("ab", frame);
+        if one.glyphs == 0 {
+            return;
+        }
+        let two = lay("ab\u{2028}cd", frame);
+        assert_eq!(two.lines.len(), 2, "two lines");
+        assert_eq!(
+            two.lines[1].start_char, 3,
+            "the second starts after the break"
+        );
+        let w = |l: &TextLayout| l.path.bounding_box().width();
+        let first_line = lay("ab\u{2028}", frame);
+        assert!((w(&first_line) - w(&one)).abs() < 1e-6, "no box drawn");
+        // The second line is the paragraph's: no first-line indent, and
+        // one line step below the first, with no space before.
+        let (x0, y0) = two.baselines[0];
+        let (x1, y1) = two.baselines[1];
+        assert!(x1 < x0 - 4.0, "{x0} {x1}");
+        let paras = lay("ab\ncd", frame);
+        let step_para = paras.baselines[0].1 - paras.baselines[1].1;
+        assert!((y0 - y1) < step_para - 1.0, "{} {}", y0 - y1, step_para);
+        // A break at the end leaves an empty line to type on.
+        assert_eq!(first_line.lines.len(), 2);
+        assert_eq!(first_line.lines[1].start_char, 3);
+        // Artistic text breaks there too.
+        let art = lay("ab\u{2028}cd", None);
+        assert_eq!(art.lines.len(), 2);
+        assert_eq!(art.lines[1].start_char, 3);
+        assert!(art.baselines[1].1 < art.baselines[0].1, "under the first");
     }
 
     /// Text mixing directions is cut into runs of one level, in text
@@ -6794,6 +7768,7 @@ mod tests {
             advance: 1.0,
             x_offset: 0.0,
             y_offset: 0.0,
+            shift_x: 0.0,
             ch,
             char_idx: 0,
             char_end: 1,
@@ -6803,6 +7778,7 @@ mod tests {
             hyphen_after: None,
             src: None,
             spacing: 0.0,
+            kashida: 0,
             joins: false,
         };
         let order = |v: &[(u8, char)]| {
@@ -6955,6 +7931,37 @@ mod tests {
         a.angle_deg = 90.0;
         let turned = f.outline(&[a, span("B")]);
         assert!(turned.path.bounding_box().x0 < -1.0);
+    }
+
+    /// Spaces typed at the end of a line of paragraph text move the
+    /// caret a space each, though they take no room in the line's
+    /// alignment (#4014); in centred text the letters stay centred.
+    #[test]
+    fn spaces_ending_a_paragraph_line_move_the_caret() {
+        if !has_fonts() {
+            return;
+        }
+        let f = fonts();
+        for align in [TextAlign::Left, TextAlign::Center] {
+            let lay = |text: &str| {
+                f.layout(&TextRequest {
+                    spans: &[span(text)],
+                    frame: Some(Size::new(100.0, 40.0)),
+                    align,
+                    para: &ParagraphStyle::default(),
+                    on_path: None,
+                })
+            };
+            let bare = lay("ab");
+            let spaced = lay("ab   ");
+            let x = |l: &TextLayout, i: usize| l.caret(i).expect("caret").0;
+            assert!((x(&spaced, 2) - x(&bare, 2)).abs() < 1e-6, "{align:?}");
+            assert!(x(&spaced, 3) > x(&spaced, 2) + 0.1, "{align:?}");
+            assert!(x(&spaced, 4) > x(&spaced, 3) + 0.1, "{align:?}");
+            assert!(x(&spaced, 5) > x(&spaced, 4) + 0.1, "{align:?}");
+            // The letters themselves sit where they did without the spaces.
+            assert_eq!(spaced.lines[0].starts[..2], bare.lines[0].starts[..2]);
+        }
     }
 
     /// Character width (#2190): at 50 % the letters and their advances
@@ -7136,6 +8143,47 @@ mod tests {
             "{}",
             back.lines[1].edges[0]
         );
+        // A list level sets the bullet and the text in by its indent, and
+        // without hanging the next lines go back under the bullet there
+        // (#3685).
+        let mut deep = symbols.clone();
+        deep.bullet.level = 2;
+        deep.bullet.level_indent = 5.0;
+        assert!((x(&lay("a", &deep)) - x(&lay("a", &symbols)) - 10.0).abs() < 1e-6);
+        deep.bullet.no_hanging = true;
+        let back = lay(&long, &deep);
+        assert!((back.lines[1].edges[0] - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn numbered_bullet_glyphs_advance_without_overlapping() {
+        if !has_fonts() {
+            return;
+        }
+        let f = fonts();
+        let mut numbers = ParagraphStyle {
+            bullets: true,
+            ..Default::default()
+        };
+        numbers.bullet.numbering = tracedraw_core::Numbering::Arabic;
+        numbers.bullet.start = 10;
+        // "10." (3 glyphs) + "a" (1 glyph) = 4 glyphs.
+        let layout = f.glyph_layout(&TextRequest {
+            spans: &[span("a")],
+            frame: Some(Size::new(60.0, 200.0)),
+            align: TextAlign::Left,
+            para: &numbers,
+            on_path: None,
+        });
+        assert_eq!(layout.glyphs.len(), 4);
+        let xs: Vec<f64> = layout.glyphs[..3]
+            .iter()
+            .map(|g| g.transform.as_coeffs()[4])
+            .collect();
+        assert!(
+            xs[0] < xs[1] && xs[1] < xs[2],
+            "bullet glyphs overlapped at {xs:?}"
+        );
     }
 
     #[test]
@@ -7216,7 +8264,7 @@ mod tests {
         glyph.line_to((1.0, 2.0));
         glyph.line_to((2.0, 0.0));
         glyph.close_path();
-        let (scale, base) = drop_cap_placement(&glyph, 3.0, 5.0, -4.0, 3.0);
+        let (scale, base) = drop_cap_placement(&glyph, 3.0, 5.0, -4.0, 3.0, 1.0);
         assert!((base - (-14.0)).abs() < 1e-9, "{base}");
         assert!((base + 2.0 * scale - (-4.0 + 2.0)).abs() < 1e-9, "{scale}");
         if !has_fonts() {
@@ -7249,6 +8297,49 @@ mod tests {
         for l in &capped_layout.lines {
             let right = l.edges.last().copied().unwrap_or(0.0);
             assert!(right <= 40.0 + 0.01, "line ends at {right}");
+        }
+    }
+
+    /// A drop cap whose letter hangs below its baseline (g, y) keeps to
+    /// its set line count: scaled to its low top alone it hung into the
+    /// line after, which was narrowed too (#2979).
+    #[test]
+    fn a_drop_cap_with_a_descender_keeps_to_its_lines() {
+        let mut g = BezPath::new();
+        g.move_to((0.0, -1.0));
+        g.line_to((1.0, 2.0));
+        g.line_to((2.0, -1.0));
+        g.close_path();
+        // Top meets the first line's top, the ink ends 1 mm under the
+        // third baseline.
+        let (scale, base) = drop_cap_placement(&g, 3.0, 5.0, -4.0, 3.0, 1.0);
+        assert!((base + 2.0 * scale - (-2.0)).abs() < 1e-9, "{scale} {base}");
+        assert!((base - scale - (-15.0)).abs() < 1e-9, "{scale} {base}");
+        if !has_fonts() {
+            return;
+        }
+        let f = fonts();
+        for word in ["ghjghj", "yghjg", "jfhfgh", "pfdhfd", "Ghjghj"] {
+            let words = format!(
+                "{word} dfhfgh fhfghf ghfghf fdhfdh dfhfgh fhfghf ghfghf \
+                 fdhfdh dfhfgh fhfghf ghfghf fdhfdh dfhfgh fhfghf ghfghf"
+            );
+            let lay = f.layout(&TextRequest {
+                spans: &[span(&words)],
+                frame: Some(Size::new(40.0, 100.0)),
+                align: TextAlign::Left,
+                para: &ParagraphStyle {
+                    drop_cap_lines: 3,
+                    ..Default::default()
+                },
+                on_path: None,
+            });
+            assert!(lay.lines.len() > 4, "{word}: {}", lay.lines.len());
+            let x = |i: usize| lay.lines[i].edges.first().copied().unwrap_or(0.0);
+            for i in 1..3 {
+                assert!(x(i) > 3.0, "{word}: line {i} starts at {}", x(i));
+            }
+            assert!(x(3) < 1.0, "{word}: line 3 starts at {}", x(3));
         }
     }
 
@@ -7638,6 +8729,56 @@ mod tests {
         assert_eq!(l.caret(99), Some(c5));
     }
 
+    /// A type block: the words shared out between lines, each line as
+    /// wide as the frame, its letters a size of their own; a narrower
+    /// frame takes more lines; the characters keep their places.
+    #[test]
+    fn a_type_block_fills_the_frame_width_line_by_line() {
+        if !has_fonts() {
+            return;
+        }
+        use kurbo::Shape as _;
+        let f = fonts();
+        let s = span("TAKE IT EASY HOMIES WE ARE GOING TO OUTER SPACE");
+        let para = ParagraphStyle {
+            type_block: true,
+            ..ParagraphStyle::default()
+        };
+        let lay = |w: f64, h: f64| {
+            f.layout(&TextRequest {
+                spans: std::slice::from_ref(&s),
+                frame: Some(Size::new(w, h)),
+                align: TextAlign::Left,
+                para: &para,
+                on_path: None,
+            })
+        };
+        let l = lay(60.0, 80.0);
+        assert!(!l.overflow);
+        assert!(l.lines.len() >= 3, "{} lines", l.lines.len());
+        // Every line reaches across the frame.
+        for line in &l.lines {
+            let (a, b) = (line.starts.first().copied(), line.ends.last().copied());
+            let (Some(a), Some(b)) = (a, b) else { continue };
+            assert!(b - a > 60.0 * 0.93 && b - a <= 60.0 + 0.5, "line {a}..{b}");
+        }
+        // Lines of other sizes: the heights of the lines differ.
+        let tall: Vec<f64> = l.lines.iter().map(|x| x.ascent).collect();
+        let (lo, hi) = tall
+            .iter()
+            .fold((f64::MAX, 0.0f64), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+        assert!(hi > lo * 1.2, "{tall:?}");
+        // The block stays inside the frame's height.
+        let b = l.path.bounding_box();
+        assert!(b.height() <= 80.0 + 2.0, "{b:?}");
+        // Narrower and taller: more lines.
+        let n = lay(30.0, 120.0);
+        assert!(n.lines.len() > l.lines.len(), "{} vs {}", n.lines.len(), l.lines.len());
+        // The characters keep their places: the lines cover them all.
+        let last = l.lines.last().map(|x| x.end_char).unwrap_or(0);
+        assert!(last + 1 >= s.text.chars().count(), "{last}");
+    }
+
     #[test]
     fn overflow_is_reported_and_fit_to_frame_fixes_it() {
         if !has_fonts() {
@@ -7753,6 +8894,7 @@ mod tests {
                 advance: 1.0,
                 x_offset: 0.0,
                 y_offset: 0.0,
+                shift_x: 0.0,
                 ch,
                 char_idx: i,
                 char_end: i + 1,
@@ -7763,6 +8905,7 @@ mod tests {
                 hyphen_after: None,
                 src: None,
                 spacing: 0.0,
+                kashida: 0,
             })
             .collect()
     }
@@ -7842,6 +8985,133 @@ mod tests {
             lines(&far, 10.0),
             vec!["ab\t".to_string(), "cd".to_string()]
         );
+    }
+
+    /// Kashida (#3827): each word stretches its best-ranked join, the
+    /// last of equal ones; the joins share the setting's part of the room
+    /// up to their most, the spaces taking the rest, and a line without
+    /// spaces gives them all of it. A face without a kashida stretches
+    /// nothing.
+    #[test]
+    fn a_justified_line_stretches_the_best_join_of_each_word() {
+        use tracedraw_core::document::Kashida;
+        // Two words of four letters, ranks after each letter.
+        let mut g = cells("abcd efgh");
+        for x in &mut g {
+            x.rtl = true;
+            x.level = 1;
+        }
+        for (i, r) in [(0, 8), (1, 2), (2, 8), (5, 4), (6, 4)] {
+            g[i].kashida = r;
+        }
+        let size = |_| 4.0;
+        let w = kashida_widths(&g, 9.0, Kashida::High, size, |_| true);
+        assert_eq!(w.iter().map(|k| k.0).collect::<Vec<_>>(), [1, 6]);
+        // High: all the room, up to 2.5 ems (10 mm) each.
+        assert!(w.iter().all(|k| (k.1 - 4.5).abs() < 1e-9), "{w:?}");
+        let w = kashida_widths(&g, 100.0, Kashida::High, size, |_| true);
+        assert!(w.iter().all(|k| (k.1 - 10.0).abs() < 1e-9), "{w:?}");
+        // Low: about a third, up to half an em.
+        let w = kashida_widths(&g, 3.0, Kashida::Low, size, |_| true);
+        let low: f64 = w.iter().map(|k| k.1).sum();
+        assert!(low > 0.0 && low < 3.0 * 0.5, "{w:?}");
+        assert!(kashida_widths(&g, 9.0, Kashida::Off, size, |_| true).is_empty());
+        assert!(kashida_widths(&g, 9.0, Kashida::High, size, |_| false).is_empty());
+        // No spaces: the one word takes the whole room, past its most.
+        let one: Vec<Glyph> = g[..4].to_vec();
+        let w = kashida_widths(&one, 30.0, Kashida::Low, size, |_| true);
+        assert_eq!(w.len(), 1);
+        assert!((w[0].1 - 30.0).abs() < 1e-9, "{w:?}");
+        // Never after a word's last letter, nor joining the next line.
+        let mut end = g.clone();
+        end[3].kashida = 1;
+        let w = kashida_widths(&end[..4], 4.0, Kashida::High, size, |_| true);
+        assert_eq!(w.iter().map(|k| k.0).collect::<Vec<_>>(), [1]);
+    }
+
+    /// Kashida (#3827) in a justified Arabic paragraph: the lines break
+    /// where they did, still fill the width, and each line but the last
+    /// stretches joins of connected letters with the face's kashida,
+    /// more for High than for Low; with it off nothing is stretched.
+    #[test]
+    fn justified_arabic_stretches_joins_with_kashida() {
+        if !has_fonts() {
+            return;
+        }
+        use tracedraw_core::document::Kashida;
+        let text = "كتب الطالب درسه في المدرسة الكبيرة ".repeat(6);
+        let width = 45.0;
+        let req = |para: &ParagraphStyle| -> (TextLayout, GlyphLayout) {
+            let spans = [span(&text)];
+            let r = TextRequest {
+                spans: &spans,
+                frame: Some(Size::new(width, 200.0)),
+                align: TextAlign::Justify,
+                para,
+                on_path: None,
+            };
+            (fonts().layout(&r), fonts().glyph_layout(&r))
+        };
+        let style = |k: Kashida| ParagraphStyle {
+            kashida: k,
+            ..ParagraphStyle::default()
+        };
+        let (off, off_g) = req(&style(Kashida::Off));
+        // A face with the letters and the kashida is needed.
+        let tatweel = fonts().glyph_layout(&TextRequest {
+            spans: &[span("\u{0640}")],
+            frame: None,
+            align: TextAlign::Left,
+            para: &ParagraphStyle::default(),
+            on_path: None,
+        });
+        let Some(t_id) = tatweel
+            .glyphs
+            .first()
+            .map(|g| g.glyph_id)
+            .filter(|id| *id != 0)
+        else {
+            return;
+        };
+        if off.lines.len() < 3 || off_g.glyphs.iter().any(|g| g.glyph_id == 0) {
+            return;
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let stretched = |g: &GlyphLayout| -> Vec<(usize, f64)> {
+            g.glyphs
+                .iter()
+                .filter(|p| p.glyph_id == t_id && p.text.is_empty())
+                .map(|p| (p.char_idx, p.path.bounding_box().width()))
+                .collect()
+        };
+        assert!(stretched(&off_g).is_empty());
+        let mut total = Vec::new();
+        for k in [Kashida::Low, Kashida::High] {
+            let (lay, g) = req(&style(k));
+            let ranges = |l: &TextLayout| -> Vec<(usize, usize)> {
+                l.lines.iter().map(|b| (b.start_char, b.end_char)).collect()
+            };
+            assert_eq!(ranges(&lay), ranges(&off), "{k:?}");
+            for b in &lay.lines[..lay.lines.len() - 1] {
+                let lo = b.edges.iter().copied().fold(f64::INFINITY, f64::min);
+                let hi = b.edges.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                assert!(
+                    lo.abs() < 0.05 && (hi - width).abs() < 0.05,
+                    "{k:?} {lo} {hi}"
+                );
+            }
+            let s = stretched(&g);
+            assert!(s.len() >= lay.lines.len() - 1, "{k:?} {s:?}");
+            for (c, _) in &s {
+                let (a, b) = (chars[*c], chars[*c + 1]);
+                assert!(
+                    kashida::rank(a, b, false).is_some() || kashida::rank(a, b, true).is_some(),
+                    "{k:?}: no join between {a} and {b}"
+                );
+            }
+            total.push(s.iter().map(|x| x.1).sum::<f64>());
+        }
+        assert!(total[1] > total[0] && total[0] > 0.0, "{total:?}");
     }
 
     /// Chinese text has no spaces: justification spreads the room between
@@ -8625,6 +9895,47 @@ mod tests {
         );
     }
 
+    /// A character moved sideways on text fitted to a path goes that far
+    /// along the path, turned with it: on a vertical path it goes up, not
+    /// off to the side (#3252).
+    #[test]
+    fn a_character_moved_sideways_on_a_path_moves_along_it() {
+        if !has_fonts() {
+            return;
+        }
+        let f = fonts();
+        let mut p = BezPath::new();
+        p.move_to((0.0, 0.0));
+        p.line_to((0.0, 100.0));
+        let tp = TextOnPath {
+            path: p,
+            ..Default::default()
+        };
+        let para = ParagraphStyle::default();
+        let box_of = |shift: f64| {
+            let mut a = span("I");
+            a.offset_x_pct = shift;
+            f.layout(&TextRequest {
+                spans: &[a],
+                frame: None,
+                align: TextAlign::Left,
+                para: &para,
+                on_path: Some(&tp),
+            })
+            .path
+            .bounding_box()
+        };
+        let still = box_of(0.0);
+        // Half the font size along the path.
+        let moved = box_of(50.0);
+        let size = span("I").size_pt * PT_MM;
+        assert!(
+            (moved.y0 - still.y0 - size / 2.0).abs() < 0.05,
+            "{still:?} {moved:?}"
+        );
+        assert!((moved.x0 - still.x0).abs() < 0.05, "{still:?} {moved:?}");
+    }
+
     fn on_path(f: &FontSystem, text: &str, tp: &TextOnPath, align: TextAlign) -> BezPath {
         let s = span(text);
         f.layout(&TextRequest {
@@ -8773,6 +10084,42 @@ mod tests {
         let hs = on_path(f, "I", &tp, TextAlign::Left).bounding_box();
         assert!((hs.height() - straight.height()).abs() < 1e-6, "{hs:?}");
         assert!(hs.width() > straight.width() + 1.0, "{hs:?}");
+    }
+
+    #[test]
+    fn radial_letters_line_up_with_the_middle_of_the_path() {
+        if !has_fonts() {
+            return;
+        }
+        let f = fonts();
+        // An L: along the bottom, then up the right side. Near its start
+        // the middle of the box is up and to the right, on the side the
+        // letters stand on, so a radial letter leans its top towards it;
+        // a turned one stands straight on the flat bottom.
+        let mut l = BezPath::new();
+        l.move_to((0.0, 0.0));
+        l.line_to((100.0, 0.0));
+        l.line_to((100.0, 100.0));
+        let mut tp = TextOnPath {
+            path: l,
+            ..Default::default()
+        };
+        let straight = f.outline(&[span("I")]).path.bounding_box();
+        let turned = on_path(f, "I", &tp, TextAlign::Left).bounding_box();
+        assert!((turned.width() - straight.width()).abs() < 1e-6);
+        tp.orientation = PathTextOrientation::Radial;
+        let radial = on_path(f, "I", &tp, TextAlign::Left);
+        let b = radial.bounding_box();
+        assert!(b.width() > straight.width() + 1.0, "{b:?}");
+        // The highest point is right of the lowest one.
+        let pts: Vec<Point> = radial
+            .elements()
+            .iter()
+            .filter_map(|e| e.end_point())
+            .collect();
+        let top = pts.iter().copied().fold(pts[0], |a, p| if p.y > a.y { p } else { a });
+        let bottom = pts.iter().copied().fold(pts[0], |a, p| if p.y < a.y { p } else { a });
+        assert!(top.x > bottom.x, "{top:?} {bottom:?}");
     }
 
     #[test]
@@ -9165,6 +10512,42 @@ mod tests {
         }
         out.extend_from_slice(&body);
         out
+    }
+
+    /// Text set in a colour font made only of pictures (as Noto Color
+    /// Emoji: CBDT, no glyf table) was drawn as nothing on screen, in
+    /// print and in PDF files: its letters come from a font that draws
+    /// them now.
+    #[test]
+    fn text_in_a_picture_only_font_is_drawn_from_another_font() {
+        let utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(u16::to_be_bytes).collect() };
+        // Its outlines' table renamed to the colour bitmaps' one (the
+        // tables sorted again by the new name table).
+        let mut font = SELAWIK.to_vec();
+        let n = usize::from(u16::from_be_bytes([font[4], font[5]]));
+        for (from, to) in [(b"glyf", b"CBDT"), (b"loca", b"CBLC"), (b"gvar", b"zvar")] {
+            if let Some(at) = (0..n)
+                .map(|i| 12 + 16 * i)
+                .find(|at| &font[*at..*at + 4] == from)
+            {
+                font[at..at + 4].copy_from_slice(to);
+            }
+        }
+        let pictures = with_names(
+            &font,
+            &[
+                (3, 1, 0x409, 1, utf16("Picture Emoji")),
+                (3, 1, 0x409, 2, utf16("Regular")),
+                (3, 1, 0x409, 4, utf16("Picture Emoji")),
+                (3, 1, 0x409, 6, utf16("PictureEmoji")),
+            ],
+        );
+        let f = system_with(&[&pictures, QUICKSAND]);
+        assert!(f.has_family("Picture Emoji"), "{:?}", f.families());
+        let layout = f.outline(&[TextSpan::new("Hello", "Picture Emoji", 24.0)]);
+        let b = layout.path.bounding_box();
+        assert!(layout.path.elements().len() > 10, "nothing drawn");
+        assert!(b.width() > 10.0, "{b:?}");
     }
 
     /// A font that names its family in Chinese only in the GBK code page

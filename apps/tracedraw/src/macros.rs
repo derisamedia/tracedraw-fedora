@@ -339,6 +339,13 @@ pub struct Editor {
     pub message: Option<String>,
     /// The caret's line, for F5 (Run Sub).
     pub caret_line: u32,
+    /// The compatibility check's last report, and whether its panel shows.
+    pub report: Option<crate::macro_convert::Report>,
+    pub show_report: bool,
+    /// The JavaScript tab: shown, its text, and the function Run starts.
+    pub js_tab: bool,
+    pub js: String,
+    pub js_run: String,
 }
 
 impl MacroState {
@@ -498,6 +505,10 @@ pub fn project_menu_key(project: &str) -> String {
 /// A macro command's name ("Module.Macro") and project, for
 /// Options > Customization.
 pub fn command_name(key: &str) -> Option<(String, String)> {
+    // A plugin's command is named the same way (#3519).
+    if let Some(named) = crate::plugins::command_name(key) {
+        return Some(named);
+    }
     let rest = key.strip_prefix("menu.macro.")?;
     let mut parts = rest.splitn(3, '|');
     let project = parts.next()?.to_string();
@@ -560,6 +571,9 @@ impl App {
                 );
                 self.macros.chosen = Some((i, None, None));
                 self.show_macro_manager();
+                // The compatibility report of what was loaded.
+                self.edit_macro(i, "", None);
+                self.check_macro_editor();
             }
             Err(e) => self.status = trf("macros.load_failed", &[("e", &e)]),
         }
@@ -719,6 +733,9 @@ impl App {
         }
         if let Some(on) = c.simulate_overprints {
             self.simulate_overprints = on;
+        }
+        for step in c.view_steps {
+            self.run_view_step(step);
         }
     }
 
@@ -980,11 +997,26 @@ impl App {
         let (name, source) = m
             .map(|m| (m.name.clone(), m.source.clone()))
             .unwrap_or_default();
+        // The report and the JavaScript tab stay while moving around the
+        // same project.
+        let kept = self
+            .macros
+            .editor
+            .take()
+            .filter(|e| e.project == project)
+            .map(|e| (e.report, e.show_report, e.js_tab, e.js, e.js_run, e.find))
+            .unwrap_or_default();
         self.macros.editor = Some(Editor {
             project,
             module: name,
             source,
             goto_line: line,
+            report: kept.0,
+            show_report: kept.1,
+            js_tab: kept.2 && line.is_none(),
+            js: kept.3,
+            js_run: kept.4,
+            find: kept.5,
             ..Default::default()
         });
     }
@@ -1456,6 +1488,30 @@ mod tests {
         );
     }
 
+    /// A VBA macro's ActiveWindow.ActiveView.ToFitAllObjects zooms to
+    /// fit what it drew, as View > Zoom To Fit does (#4020).
+    #[test]
+    fn a_macro_zooms_to_fit_what_it_drew() {
+        let code = "Sub Go()\r\n\
+            ActiveDocument.Unit = cdrMillimeter\r\n\
+            ActiveLayer.CreateRectangle2 150, 120, 20, 20\r\n\
+            ActiveWindow.ActiveView.ToFitAllObjects\r\n\
+            End Sub\r\n";
+        let mut app = app_with(project("Fit", code, Vec::new()));
+        app.canvas_rect =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        app.fit_pending = false;
+        app.view.fit(
+            tracedraw_core::geometry::Rect::new(0.0, 0.0, 600.0, 600.0),
+            app.canvas_rect,
+        );
+        let before = app.view.zoom;
+        app.run_macro(0, "Main", "Go");
+        drive(&mut app, |_| {});
+        assert!(app.macros.error.is_none(), "{:?}", app.macros.error);
+        assert!(app.view.zoom > before * 4.0, "{before} {}", app.view.zoom);
+    }
+
     #[test]
     fn a_macro_turns_on_simulated_overprints_and_grouping_keeps_overprint() {
         let code = "Sub Go()\r\n\
@@ -1669,6 +1725,41 @@ mod tests {
         }
         // The app's clipboard is not touched.
         assert!(app.clipboard.is_none());
+    }
+
+    /// A macro that puts each selected object into a clip frame of its
+    /// own (#2968), and one that centres the contents on the frame. The
+    /// macro of the report calls these members by other names, which
+    /// reach them through `__member_alias` (see vg_tests).
+    #[test]
+    fn a_macro_puts_each_selected_object_into_its_own_clip_frame() {
+        let code = "Sub Go()\r\n\
+            ActiveDocument.Unit = cdrMillimeter\r\n\
+            Dim s As Shape, r As Shape, f As Shape, c As Shape\r\n\
+            ActiveDocument.CreateShapeRangeFromArray(ActiveLayer.CreateEllipse2(10#, 10#, 5#), ActiveLayer.CreateEllipse2(40#, 10#, 5#)).CreateSelection\r\n\
+            For Each s In ActiveSelectionRange\r\n\
+            Set r = ActiveLayer.CreateRectangle2(s.LeftX - 2#, s.BottomY - 2#, s.SizeWidth + 4#, s.SizeHeight + 4#)\r\n\
+            s.AddToClipFrame r\r\n\
+            Next s\r\n\
+            Debug.Print \"frames \" & ActiveLayer.Shapes.Count\r\n\
+            For Each f In ActiveLayer.Shapes\r\n\
+            Debug.Print \"holds \" & f.ClipFrame.Shapes.Count & \" \" & (f.ClipFrame.Shapes.Item(1).ClipFrameParent.StaticID = f.StaticID)\r\n\
+            Next f\r\n\
+            Set f = ActiveLayer.CreateRectangle2(0#, 0#, 20#, 20#)\r\n\
+            Set c = ActiveLayer.CreateEllipse2(100#, 100#, 3#)\r\n\
+            c.AddToClipFrame f, cdrTrue\r\n\
+            Set c = f.ClipFrame.Shapes.Item(1)\r\n\
+            Debug.Print \"centred \" & Round(c.CenterX, 3) & \" \" & Round(c.CenterY, 3)\r\n\
+            End Sub\r\n";
+        let mut app = app_with(project("Frames", code, Vec::new()));
+        app.run_macro(0, "Main", "Go");
+        drive(&mut app, |_| {});
+        assert!(app.macros.error.is_none(), "{:?}", app.macros.error);
+        let out = &app.scripts_output;
+        let holds = out.iter().filter(|l| *l == "holds 1 True").count();
+        assert!(out.iter().any(|l| l == "frames 2"), "{out:?}");
+        assert_eq!(holds, 2, "{out:?}");
+        assert!(out.iter().any(|l| l == "centred 10 10"), "{out:?}");
     }
 
     /// What the macros of a published collection use that stopped them

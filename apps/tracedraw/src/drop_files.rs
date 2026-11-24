@@ -135,8 +135,17 @@ impl App {
         }
     }
 
-    /// Open or import one dropped file.
+    /// Open or import one dropped file. A .zip holding drawings or
+    /// pictures (a .cdr a messaging app sent as `name.cdr.zip`) has them
+    /// unpacked and each dropped in its turn (#3853).
     pub fn drop_file(&mut self, path: &Path, on: DropOn) {
+        let inside = unpack_drawings(path);
+        if !inside.is_empty() {
+            for p in &inside {
+                self.drop_file(p, on);
+            }
+            return;
+        }
         match self.dropped_kind(path, on) {
             Dropped::Import => {
                 let at = self.view_center();
@@ -237,8 +246,23 @@ impl App {
     /// would go (the drawing window, or the whole window) and what a drop
     /// there would do.
     pub fn draw_drop_hint(&self, ctx: &egui::Context) {
-        let hovered: Vec<Option<PathBuf>> =
-            ctx.input(|i| i.raw.hovered_files.iter().map(|f| f.path.clone()).collect());
+        let listed: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .hovered_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        // Without the files of a lost drop still listed (#2940).
+        let stale = listed.len() - self.file_drag.fresh(&listed).len();
+        let hovered: Vec<Option<PathBuf>> = ctx.input(|i| {
+            i.raw
+                .hovered_files
+                .iter()
+                .skip(stale)
+                .map(|f| f.path.clone())
+                .collect()
+        });
         if hovered.is_empty() || !drag_held() || !self.file_drag.showing() {
             return;
         }
@@ -306,6 +330,11 @@ pub struct FileDrag {
     over: bool,
     /// The files last let go for a lost drop, and when.
     lost: Option<(Vec<PathBuf>, f64)>,
+    /// The files listed as hovered when a drop was lost: the windowing
+    /// layer keeps listing them, ahead of a later drag's own, until a drop
+    /// or a leave does reach the program. They belong to a drag that is
+    /// over and are not let go again (#2940).
+    stale: Vec<PathBuf>,
 }
 
 impl FileDrag {
@@ -323,7 +352,11 @@ impl FileDrag {
             self.files.clear();
             self.released = None;
             self.over = false;
+            self.stale.clear();
             return Vec::new();
+        }
+        if !hovered.starts_with(&self.stale) {
+            self.stale.clear();
         }
         if hovered != self.files.as_slice() {
             self.files = hovered.to_vec();
@@ -342,8 +375,21 @@ impl FileDrag {
             return Vec::new();
         }
         self.over = true;
-        self.lost = Some((self.files.clone(), now));
-        self.files.clone()
+        let files = self.fresh(hovered).to_vec();
+        self.stale = hovered.to_vec();
+        if files.is_empty() {
+            return files;
+        }
+        self.lost = Some((files.clone(), now));
+        files
+    }
+
+    /// The files of `hovered` that belong to the drag going on: without
+    /// those of an earlier lost drop still listed ahead of them. Before,
+    /// they counted again, and a file dropped, then deleted, came back
+    /// with every later drop until TraceDraw was restarted (#2940).
+    pub fn fresh<'a>(&self, hovered: &'a [PathBuf]) -> &'a [PathBuf] {
+        hovered.strip_prefix(self.stale.as_slice()).unwrap_or(hovered)
     }
 
     /// The drop frame shows: a drag goes on with a button held.
@@ -367,6 +413,81 @@ impl FileDrag {
             _ => false,
         }
     }
+}
+
+/// The drawings (files TraceDraw opens) a .zip at `path` holds, unpacked into a
+/// folder of their own under the temporary folder; none when `path` is
+/// not a readable .zip or holds none (folders and other files are left).
+pub fn unpack_drawings(path: &Path) -> Vec<PathBuf> {
+    let is_zip = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("zip"));
+    if !is_zip {
+        return Vec::new();
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(std::io::BufReader::new(file)) else {
+        return Vec::new();
+    };
+    let wanted = |name: &str| {
+        let p = Path::new(name);
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        !name.starts_with("__MACOSX")
+            && !p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("._"))
+            && OPEN_EXTENSIONS.contains(&ext.as_str())
+            // Texts and tables beside a drawing are notes, not drawings.
+            && !matches!(
+                ext.as_str(),
+                "txt" | "rtf" | "docx" | "xlsx" | "csv" | "tsv" | "zip"
+            )
+    };
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "tracedraw-zip-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut out = Vec::new();
+    for i in 0..archive.len() {
+        let Ok(mut entry) = archive.by_index(i) else {
+            continue;
+        };
+        let Ok(entry_name) = entry.name().map(|n| n.to_string()) else {
+            continue;
+        };
+        if !entry.is_file() || !wanted(&entry_name) {
+            continue;
+        }
+        // Only the file's own name: no folder of the archive is made, and
+        // no name can climb out of the folder.
+        let Some(name) = entry
+            .enclosed_name()
+            .and_then(|p| p.file_name().map(|n| n.to_owned()))
+        else {
+            continue;
+        };
+        if std::fs::create_dir_all(&dir).is_err() {
+            return Vec::new();
+        }
+        let to = dir.join(name);
+        let Ok(mut f) = std::fs::File::create(&to) else {
+            continue;
+        };
+        if std::io::copy(&mut entry, &mut f).is_ok() {
+            out.push(to);
+        }
+    }
+    out
 }
 
 /// The pointer over the window, in points, while files are dragged over
@@ -757,6 +878,34 @@ mod tests {
         assert!(ctx.has_requested_repaint());
     }
 
+    /// #3853: a drawing sent zipped (`sample.svg.zip`) and dropped opens
+    /// as the drawing inside; the archive's other files are left.
+    #[test]
+    fn a_zipped_drawing_dropped_opens_as_the_drawing_inside() {
+        let (ctx, mut app) = setup();
+        let dir = dir("zipped");
+        let svg = std::fs::read(svg(&dir)).expect("svg");
+        let path = dir.join("sample.svg.zip");
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let o = zip::write::SimpleFileOptions::default();
+        zip.start_file("notes.txt", o).expect("txt");
+        std::io::Write::write_all(&mut zip, b"hello").expect("write");
+        zip.start_file("art/sample.svg", o).expect("svg");
+        std::io::Write::write_all(&mut zip, &svg).expect("write");
+        std::fs::write(&path, zip.finish().expect("zip").into_inner()).expect("zip file");
+        let inside = super::unpack_drawings(&path);
+        assert_eq!(inside.len(), 1, "{inside:?}");
+        assert_eq!(
+            inside[0].file_name().and_then(|n| n.to_str()),
+            Some("sample.svg")
+        );
+        app.show_welcome = true;
+        let docs = app.docs.len();
+        frame(&ctx, &mut app, vec![path], false);
+        assert_eq!(app.docs.len(), docs + 1, "{}", app.status);
+        assert!(shape_count(&app) > 0);
+    }
+
     /// #2686: on Windows a drop (or the drag leaving) could fail to reach
     /// the program; the files stayed listed as hovered and the drop frame
     /// came back at every later click. Once the buttons have been up a
@@ -801,6 +950,39 @@ mod tests {
         let b = vec![PathBuf::from("b.png")];
         assert!(d.step(&b, false, true, 0.7).is_empty());
         assert!(d.showing());
+    }
+
+    /// #2940: after a lost drop its files stay listed as hovered, ahead of
+    /// the next drag's own, until a drop or a leave reaches the program.
+    /// They are not let go again: a file dropped and then deleted came
+    /// back with every later drop until TraceDraw was restarted.
+    #[test]
+    fn a_lost_drops_files_still_listed_do_not_come_back_with_the_next() {
+        let a = PathBuf::from("a.svg");
+        let b = PathBuf::from("b.png");
+        let mut d = FileDrag::default();
+        d.step(&[a.clone()], false, true, 0.0);
+        d.step(&[a.clone()], false, false, 0.1);
+        assert_eq!(d.step(&[a.clone()], false, false, 1.0), [a.clone()]);
+        // Still listed alone: no frame, nothing let go.
+        assert!(d.step(&[a.clone()], false, true, 2.0).is_empty());
+        assert!(!d.showing());
+        // The next drag lists its file after the old one.
+        let both = vec![a.clone(), b.clone()];
+        assert!(d.step(&both, false, true, 3.0).is_empty());
+        assert!(d.showing());
+        assert_eq!(d.fresh(&both), [b.clone()]);
+        d.step(&both, false, false, 3.1);
+        assert_eq!(d.step(&both, false, false, 4.0), [b.clone()]);
+        // A third drag, of the first file again, lets that go.
+        let again = vec![a.clone(), b.clone(), a.clone()];
+        d.step(&again, false, true, 5.0);
+        assert!(d.showing());
+        d.step(&again, false, false, 5.1);
+        assert_eq!(d.step(&again, false, false, 6.0), [a.clone()]);
+        // A drop that reaches the program ends it all.
+        assert!(d.step(&again, true, false, 7.0).is_empty());
+        assert_eq!(d.fresh(&again), again.as_slice());
     }
 
     /// #2686: the files of a lost drop let go over the drawing window are

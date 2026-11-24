@@ -21,13 +21,13 @@ smoothing (0 to 100, 50 at first) on the property bar sets how much: a
 higher value gives fewer nodes and a softer line. When you are zoomed in,
 the line keeps more detail.
 
-To draw a straight line with this tool, click where the line starts and
-click again where it ends. Hold <kbd>Ctrl</kbd> to keep the line to steps of
-15 degrees. <kbd>Esc</kbd> drops the first click.
-
-To draw a line of several straight segments, click where it starts, then
-double-click at each corner, and click once where it ends. <kbd>Space</kbd>,
-<kbd>Enter</kbd> or <kbd>Esc</kbd> ends it at the last corner.
+To draw straight lines with this tool, click where the line starts, click
+once at each corner, and double-click where it ends: each click adds a node
+and the line goes on, and the double-click ends it there. For a single
+straight line, click where it starts and double-click where it ends. Hold
+<kbd>Ctrl</kbd> to keep each segment to steps of 15 degrees. <kbd>Space</kbd>,
+<kbd>Enter</kbd> or <kbd>Esc</kbd> ends the line at the last node, and
+<kbd>Esc</kbd> drops a lone first click.
 
 With a graphics tablet, the pen's pressure sets the width of the line along
 it; see [Drawing with a graphics tablet](pen-pressure.md).
@@ -37,6 +37,17 @@ it; see [Drawing with a graphics tablet](pen-pressure.md).
 The [[tool.two_point_line]] tool draws one straight segment: press where it
 starts and release where it ends, or click twice. Hold <kbd>Ctrl</kbd> to
 keep it to steps of 15 degrees.
+
+Turn on **Arc** on the property bar to drag a quarter arc
+instead: it leaves the press upright and arrives across at the release
+(round, as a quarter circle, when the drag is as tall as it is wide; hold
+<kbd>Ctrl</kbd> for that). **Flip arc** bows it the other way.
+
+Hold <kbd>C</kbd> while you drag an arc, or a rectangle, ellipse, polygon or
+star with its own tool, to leave a copy of the shape at every move of the
+pointer: a fan of arcs from one point, or a tunnel of rectangles, in one
+drag. The copies and the shape you release are one undo step and stay
+selected, ready to group, mirror or color.
 
 ## Bezier {#bezier}
 
@@ -116,6 +127,23 @@ handles.
 
 The result is an ordinary curve; the control points are not kept.
 
+## Curvature Pen {#curvature-pen}
+
+The [[tool.curvature_pen]] tool draws a smooth curve through the points you
+click, with no handles to pull.
+
+1. Click to place each point. The curve runs through every point and bends
+   smoothly by itself; the preview shows where the next click takes it.
+2. Hold <kbd>Alt</kbd> (or <kbd>C</kbd> or <kbd>V</kbd>) while you click to
+   make that point a corner.
+3. Double-click or press <kbd>Enter</kbd> to finish. Click the first point
+   (once there are three) to close the curve.
+
+The result is an ordinary curve whose nodes are the points you clicked, so
+the [[tool.shape]] tool edits it like any other.
+
+![Four clicks with the Curvature Pen: a smooth curve runs through each point](../../img/lines-shapes-lines-curvature-pen.png)
+
 ## Polyline {#polyline}
 
 The [[tool.polyline]] tool draws straight segments one after the other:
@@ -165,6 +193,17 @@ style and start and end arrowheads, and a button that closes an open curve.
 The [[tool.freehand]] tool adds the smoothing. With nothing selected, it
 reminds you how to finish a curve. See [Outlines](outlines.md) for the
 outline settings.
+
+**Parallel lines** (with the Freehand, Bezier, Pen, Polyline, 2-Point Line and
+3-Point Curve tools) draws lines alongside each new curve: set how many
+**Lines** on each side, the **Gap** from one line to the next, and whether
+they go on **Both sides** or only on the curve's left. The lines are curves of
+their own with the curve's outline, selected with it; one Undo takes them away
+and leaves the curve. It is off at first.
+
+While you pull the handle of the first node of a curve with the Pen or Bezier
+tool, the opposite handle shows too, so you see the direction the curve leaves
+in both ways.
 
 ## Editing curves afterwards {#edit}
 

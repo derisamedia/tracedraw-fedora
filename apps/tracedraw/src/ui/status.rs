@@ -52,6 +52,14 @@ impl StatusInfo {
 /// shaping brushes add how their nib is sized, with the wheel's key of
 /// the wheel setting (see `brushes::wheel_resizes`).
 pub fn tool_hint(app: &App) -> String {
+    // Over a path's outline the Text tool types along it (#3255).
+    if app.tool == Tool::Text
+        && app
+            .pointer_page
+            .is_some_and(|p| app.text_tool_path_at(p).is_some())
+    {
+        return tr("status_hint.text_on_path");
+    }
     let hint = tool_hint_for(app.tool, app.selection.is_empty());
     if !app.tool.is_shaping_brush() {
         return hint;
@@ -132,15 +140,7 @@ pub fn object_info(app: &App) -> String {
                         ("k", &kind_name(k)),
                         (
                             "mode",
-                            &tr(match crate::bitmap_fx::mode_of(s.cmyk_bitmap, png) {
-                                crate::bitmap_fx::ColorMode::Cmyk => "convert_colors.cmyk",
-                                crate::bitmap_fx::ColorMode::Grayscale => "convert_colors.gray",
-                                crate::bitmap_fx::ColorMode::Paletted => {
-                                    "dialog.convert_mode_paletted"
-                                }
-                                crate::bitmap_fx::ColorMode::Lab => "convert_colors.lab",
-                                crate::bitmap_fx::ColorMode::Rgb => "convert_colors.rgb",
-                            }),
+                            &tr(crate::bitmap_fx::mode_key(s.cmyk_bitmap, png)),
                         ),
                     ],
                 ),
@@ -148,6 +148,20 @@ pub fn object_info(app: &App) -> String {
             };
             if app.is_effect_clone(s.id) {
                 kind = format!("{kind} ({})", tr("status.effect_clone"));
+            }
+            // A symmetry and an object clone say so, and a clone's master
+            // how many clones follow it (#2997, #2877).
+            kind = crate::ui::dockers::tagged_kind(s, kind);
+            let clones = app
+                .object_clones()
+                .iter()
+                .filter(|(_, m)| *m == s.id)
+                .count();
+            if clones > 0 {
+                kind = trf(
+                    "status.clone_master_kind",
+                    &[("k", &kind), ("n", &clones.to_string())],
+                );
             }
             if tracedraw_core::linked_text::link_of(s).is_some() {
                 let n = app.doc().content_linked_with(s.id).len();
@@ -340,6 +354,10 @@ fn outline_text(app: &App, stroke: &Option<tracedraw_core::Stroke>) -> String {
 }
 
 pub fn status_bar(app: &mut App, ui: &mut Ui) {
+    if app.pixel_edit.is_some() {
+        crate::ui::pixel_mode::status_bar(app, ui);
+        return;
+    }
     let full = ui.available_rect_before_wrap();
     // The separator between the bar and the drawing window, the colour of
     // the palette lines: over the bar at the bottom of the window, under

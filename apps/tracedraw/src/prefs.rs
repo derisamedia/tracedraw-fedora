@@ -63,12 +63,17 @@ pub struct PrintPrefs {
     pub bleed_limit: f64,
     pub page_numbers: bool,
     pub ps_level: u8,
+    /// PostScript to a PostScript printer (#4052).
+    pub ps_to_printer: bool,
     /// Pages keep their size on a fixed sheet when marks need room (#388).
     pub keep_size: bool,
     /// Custom sheet sizes saved with a name in Print (#591), and the
     /// Custom size last used.
     pub sheet_presets: Vec<(String, tracedraw_core::geometry::Size)>,
     pub custom_sheet: tracedraw_core::geometry::Size,
+    /// The printer's colour profile file and the intent by name (#3374).
+    pub output_profile: Option<String>,
+    pub output_intent: String,
 }
 
 impl Default for PrintPrefs {
@@ -106,7 +111,10 @@ impl Default for PrintPrefs {
             bleed_limit: st.bleed_limit,
             page_numbers: st.page_numbers,
             ps_level: st.ps_level,
+            ps_to_printer: st.ps_to_printer,
             keep_size: st.keep_size,
+            output_profile: None,
+            output_intent: st.output_intent.name().to_string(),
         }
     }
 }
@@ -152,6 +160,7 @@ impl PrintPrefs {
             },
             page_numbers: self.page_numbers,
             ps_level: self.ps_level.clamp(2, 3),
+            ps_to_printer: self.ps_to_printer,
             keep_size: self.keep_size,
             gutter: gap_or(self.gutter, PrintState::default().gutter),
             gutter_y: gap_or(
@@ -159,6 +168,9 @@ impl PrintPrefs {
                 PrintState::default().gutter_y,
             ),
             gaps_linked: self.gaps_linked,
+            output_profile: self.output_profile.clone(),
+            output_intent: tracedraw_core::icc::Intent::from_name(&self.output_intent)
+                .unwrap_or(tracedraw_core::icc::Intent::Perceptual),
             ..PrintState::default()
         }
     }
@@ -192,7 +204,10 @@ impl PrintPrefs {
         self.bleed_limit = st.bleed_limit;
         self.page_numbers = st.page_numbers;
         self.ps_level = st.ps_level;
+        self.ps_to_printer = st.ps_to_printer;
         self.keep_size = st.keep_size;
+        self.output_profile = st.output_profile.clone();
+        self.output_intent = st.output_intent.name().to_string();
     }
 }
 
@@ -246,6 +261,10 @@ pub struct FormatPrefs {
     /// File > Import waits for a click, a drag or Space to place what
     /// came (#1936); off, it comes in at once where `import_place` says.
     pub import_with_cursor: bool,
+    /// A picture File > Import brings in stays linked to its file (Image >
+    /// Update from Link, read again when the file changes); off, it is
+    /// embedded only (#3089).
+    pub import_link_pictures: bool,
     /// The `.cdr` version Save As starts at (#613).
     pub cdr_version: u16,
     /// Save As starts at `.cdr` rather than TraceDraw for a drawing
@@ -254,6 +273,9 @@ pub struct FormatPrefs {
     /// File > Export goes straight to the file with the last choices
     /// ("Do not show filter dialog").
     pub skip_export_dialog: bool,
+    /// File > Export starts with Selected only ticked when objects are
+    /// selected (#3208).
+    pub export_selected_only: bool,
     /// PDF and AI files: text read in as curves from the fonts the file
     /// embeds (else as editable text, #386).
     pub pdf_text_as_curves: bool,
@@ -293,9 +315,11 @@ impl Default for FormatPrefs {
             remember_last: true,
             import_place: ImportPlace::AsInFile,
             import_with_cursor: true,
+            import_link_pictures: true,
             cdr_version: tracedraw_cdr::write::NEWEST_VERSION,
             save_new_as_cdr: false,
             skip_export_dialog: false,
+            export_selected_only: false,
             pdf_text_as_curves: false,
             pdf_text_paragraphs: true,
             pdf_ask_text: true,
@@ -348,6 +372,9 @@ pub struct LayoutPreset {
     pub margins: [f64; 4],
     pub booklet_binding: usize,
     pub signature_sheets: u32,
+    /// Booklet pages per sheet side: 0 two, 1 four, 2 eight (#3380).
+    #[serde(default)]
+    pub booklet_up: usize,
     pub creep: f64,
     pub booklet_gap: f64,
     pub bleed: bool,
@@ -581,6 +608,7 @@ impl LayoutPreset {
             margins: st.margins,
             booklet_binding: st.booklet_binding,
             signature_sheets: st.signature_sheets,
+            booklet_up: st.booklet_up,
             creep: st.creep,
             booklet_gap: st.booklet_gap,
             bleed: st.bleed,
@@ -644,6 +672,7 @@ impl LayoutPreset {
         }
         st.booklet_binding = self.booklet_binding.min(1);
         st.signature_sheets = self.signature_sheets.clamp(1, 32);
+        st.booklet_up = self.booklet_up.min(2);
         st.creep = num(self.creep, 0.0, 20.0, 0.0);
         st.booklet_gap = num(self.booklet_gap, 0.0, 100.0, 0.0);
         st.bleed = self.bleed;
@@ -732,6 +761,14 @@ pub struct ExportPreset {
     pub plt_resolution: f64,
     /// SVG's text: as curves, as text, as text with its fonts (#2289).
     pub svg_text: usize,
+    /// DXF's drawing unit (#3583); presets saved before have none and
+    /// stay in millimetres.
+    pub dxf_units: usize,
+    /// WMF: dashes as solid lines (#3819).
+    pub wmf_solid_dashes: bool,
+    /// Bitmaps: anti-aliasing (#3807); presets saved before have none
+    /// and keep it on.
+    pub anti_alias: bool,
 }
 
 impl Default for ExportPreset {
@@ -779,6 +816,9 @@ impl ExportPreset {
             plt_one_pen: st.plt_one_pen,
             plt_resolution: st.plt_resolution,
             svg_text: st.svg_text,
+            dxf_units: st.dxf_units,
+            wmf_solid_dashes: st.wmf_solid_dashes,
+            anti_alias: st.anti_alias,
         }
     }
 
@@ -815,6 +855,11 @@ impl ExportPreset {
         if self.color_mode < EXPORT_COLOR_MODES.len() {
             st.color_mode = self.color_mode;
         }
+        if self.dxf_units < crate::ui::dialogs::DXF_UNIT_KEYS.len() {
+            st.dxf_units = self.dxf_units;
+        }
+        st.wmf_solid_dashes = self.wmf_solid_dashes;
+        st.anti_alias = self.anti_alias;
         self.apply_plt(st);
         self.apply_size(st);
         st.preset = self.name.clone();
@@ -1086,6 +1131,13 @@ pub struct WarningPrefs {
     /// own, so "Do not show this message again" ticked on the plain note
     /// before the dialog existed does not silence the dialog (#1243).
     pub ask_missing_fonts: bool,
+    /// Take the automatic font for each missing one without asking
+    /// (#3725): the Missing Fonts dialog's choices made at once, as OK
+    /// with the automatic fonts would, when every missing family has one.
+    pub accept_missing_fonts: bool,
+    /// With [`Self::accept_missing_fonts`]: replace the families in the
+    /// drawing (saved with it) rather than for this session only.
+    pub accept_missing_fonts_keep: bool,
     /// Before an item is taken off the Shelf.
     pub shelf_remove: bool,
     /// The hint to turn on hardware acceleration when the window is
@@ -1100,6 +1152,8 @@ impl Default for WarningPrefs {
             unread_objects: true,
             missing_fonts: true,
             ask_missing_fonts: true,
+            accept_missing_fonts: false,
+            accept_missing_fonts_keep: true,
             shelf_remove: true,
             hardware_acceleration: true,
         }
@@ -1147,6 +1201,59 @@ pub struct CurvePrefs {
     /// segment, so higher values make more lines.
     #[serde(default)]
     pub straight_threshold: u32,
+    /// Freehand: a line of clicks ends at the second click, one straight
+    /// segment (#3848). Off at first: each click adds a node and the line
+    /// goes on until a double-click, Space or Enter (#2339).
+    #[serde(default)]
+    pub freehand_click_ends: bool,
+    /// Parallel Lines on the curve tools' property bar (#3626): lines
+    /// drawn alongside each new curve. Off at first.
+    #[serde(default)]
+    pub parallel: ParallelLines,
+}
+
+/// Lines drawn alongside each curve made with the Freehand, Bezier, Pen,
+/// Polyline, 2-Point Line and 3-Point Curve tools (`parallel_lines.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ParallelLines {
+    pub on: bool,
+    /// Lines on each side drawn on, 1 to 10.
+    pub count: u32,
+    /// The distance from one line to the next, mm.
+    pub gap: f64,
+    /// Lines on both sides of the curve, else on its left only.
+    pub both_sides: bool,
+}
+
+impl Default for ParallelLines {
+    fn default() -> Self {
+        ParallelLines {
+            on: false,
+            count: 1,
+            gap: 5.0,
+            both_sides: false,
+        }
+    }
+}
+
+impl ParallelLines {
+    /// The distances of the lines from the curve, left positive, nearest
+    /// first: none while off.
+    pub fn distances(&self) -> Vec<f64> {
+        if !self.on || !self.gap.is_finite() || self.gap <= 0.0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for k in 1..=self.count.clamp(1, 10) {
+            let d = f64::from(k) * self.gap;
+            out.push(d);
+            if self.both_sides {
+                out.push(-d);
+            }
+        }
+        out
+    }
 }
 
 /// The modifier key that constrains the angle while drawing curves.
@@ -1192,6 +1299,8 @@ impl Default for CurvePrefs {
             pen_ignores_hand: true,
             corner_threshold: 0,
             straight_threshold: 0,
+            freehand_click_ends: false,
+            parallel: ParallelLines::default(),
         }
     }
 }
@@ -1471,6 +1580,35 @@ mod tests {
         assert!(!st.all_pages);
     }
 
+    /// The DXF export's unit is kept in a preset and comes back, and the
+    /// export writes it; presets from before and unknown units stay in
+    /// millimetres (#3583).
+    #[test]
+    fn a_preset_keeps_the_dxf_unit() {
+        use tracedraw_io::dxf::DxfUnits;
+        let st = ExportState {
+            dxf_units: 3,
+            ..ExportState::default()
+        };
+        assert_eq!(st.dxf_options().units, DxfUnits::Inches);
+        let p = ExportPreset::from_state("inches", &st);
+        let json = serde_json::to_string(&p).unwrap();
+        let back: ExportPreset = serde_json::from_str(&json).unwrap();
+        let mut fresh = ExportState::default();
+        back.apply(&mut fresh);
+        assert_eq!(fresh.dxf_options().units, DxfUnits::Inches);
+        let old: ExportPreset = serde_json::from_str(r#"{"name": "x"}"#).unwrap();
+        let mut fresh = ExportState::default();
+        old.apply(&mut fresh);
+        assert_eq!(fresh.dxf_options().units, DxfUnits::Millimeters);
+        let bad = ExportPreset {
+            dxf_units: 9,
+            ..ExportPreset::default()
+        };
+        bad.apply(&mut fresh);
+        assert_eq!(fresh.dxf_units, 0);
+    }
+
     /// The AI export's kind (PDF-compatible or classic version 8) is
     /// kept in a preset and comes back; an unknown one is ignored (#1728).
     #[test]
@@ -1581,6 +1719,7 @@ mod tests {
         // The Save dialog first; a name without an extension keeps PDF.
         crate::files::test_save::answer(Some(std::env::temp_dir().join("td-prefs")));
         app.export();
+        crate::files::test_save::finish(&mut app);
         assert!(matches!(&app.dialog, Dialog::Export(st) if st.format == 1 && st.remember));
         // The presets for the web and office never overwrite the choices.
         assert!(!ExportState::web().remember && !ExportState::office().remember);

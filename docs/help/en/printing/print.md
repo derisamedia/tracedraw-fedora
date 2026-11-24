@@ -44,6 +44,12 @@ and **Apply** keeps them for the next time.
   Print Preview you can untick inks under **Print separations**; only the
   ticked inks print.
 - **Convert spot colors to CMYK** prints spot inks as their CMYK mix.
+- **Color profile** converts the colors and pictures to the printer's ICC
+  profile (RGB or CMYK, from the profiles installed on this computer), for
+  printers whose driver does not manage color, such as sublimation printers.
+  Choose the **Intent** beside it. It works with Composite output, not with
+  Grayscale or Separations. Turn off the color management of the printer's
+  driver so the colors are not converted twice.
 
 ## Composite {#composite}
 
@@ -54,8 +60,9 @@ and **Apply** keeps them for the next time.
 ## Layout {#layout}
 
 - **As in document**, **Fit to page**, or **Scale** to a percentage. **Fit
-  to page** also shrinks objects larger than the page (or the selection, when
-  you print only that) so they print whole on it.
+  to page** scales the page to fill the paper inside its margins, larger or
+  smaller; what you put partly off the page stays cut at its edge, as on
+  screen. When you print only the selection, it shrinks to fit the page.
 - **Bleed limit**: how far beyond the page objects print (4 mm at first, or
   the drawing's own bleed).
 - **Paper margins** (left, right, top, bottom, 0 at first) keep the paper's
@@ -138,6 +145,24 @@ imposition and the marks.
 - Drag the dashed blue lines on the sheet to set the paper margins, and drag
   the sheet to move the artwork on its page (**Artwork position** shows the
   move, with **Reset**). **Transform** draws handles to stretch the artwork.
+
+## Viewing one ink while you draw {#view-separations}
+
+[[menu.view > menu.view.separations]] shows the page in the drawing window
+as one ink prints it, in that ink's colour: Cyan in cyan, Magenta in
+magenta, and each spot ink of the drawing under its own name. Choose an ink
+from the submenu and keep editing; the drawing itself does not change.
+[[menu.view.separations_composite]] shows every ink again.
+
+![Three overlapping cyan, magenta and yellow circles seen through the magenta ink alone](../../img/printing-print-view-separations.png)
+
+## Flattening transparency {#flatten-transparency}
+
+Some printers and older file formats cannot mix see-through objects with
+what lies beneath them. [[menu.object > menu.object.flatten_transparency]]
+turns the selected objects into one opaque bitmap of how they look over
+what is under them, at 300 dpi and shaped like them, in their place in the
+stack. The objects beneath stay as they are. One undo step takes it back.
 
 ## Other ways to print {#other}
 
